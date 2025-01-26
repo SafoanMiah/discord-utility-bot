@@ -101,7 +101,7 @@ async def create_vc(interaction: Interaction, name: str):
         )
     }
     category = interaction.channel.category if interaction.channel else None
-    vc = await interaction.guild.create_voice_channel(name, category=category, overwrites=overwrites)
+    vc = await interaction.guild.create_voice_channel(f'!{name}', category=category, overwrites=overwrites)
     user_vc_map[interaction.user.id] = vc.id
     await interaction.response.send_message(f"Created VC: {vc.mention}", ephemeral=True)
 
