@@ -6,12 +6,15 @@ from dotenv import load_dotenv
 import asyncio
 import sys
 
+# Load environment variables from .env file
 load_dotenv()
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
+# Set event loop policy for Windows
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
+# Set up bot intents and command prefix
 intents = discord.Intents.default()
 intents.members = True
 intents.voice_states = True
@@ -42,11 +45,13 @@ class RoleSelect(discord.ui.Select):
             ephemeral=True
         )
 
+# View for role setup
 class RoleSetupView(discord.ui.View):
     def __init__(self, roles: list[discord.Role]):
         super().__init__(timeout=None)
         self.add_item(RoleSelect(roles))
 
+# Event when bot is ready
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
@@ -60,12 +65,6 @@ async def on_ready():
         print(f"Slash commands synced: {len(synced)}")
     except Exception as e:
         print(e)
-
-
-
-
-
-
 
 # Voice Channel Commands
 @bot.tree.command(name="setup", description="Choose which role can create voice channels.")
@@ -129,11 +128,6 @@ async def vcendall(interaction: Interaction):
             await ch.delete()
         del user_vc_map[uid]
     await interaction.response.send_message("All custom VCs deleted.", ephemeral=True)
-
-
-
-
-
 
 # Sticky Commands
 @bot.tree.command(name="sticky", description="Admin-only: Set or remove a sticky text in the channel.")
@@ -210,12 +204,6 @@ async def stickyembed_command(
 
     await interaction.response.send_message("Sticky embed set for this channel!", ephemeral=True)
 
-
-
-
-
-
-
 # Background Tasks
 @tasks.loop(minutes=5)
 async def cleanup_empty_vcs():
@@ -259,9 +247,17 @@ async def repost_stickies():
                 msg = await channel.send(embed=embed)
                 data["last_id"] = msg.id
 
+@bot.tree.command(name="purge", description="Admin-only: Purge a number of messages from the channel.")
+@app_commands.describe(number="Number of messages to purge")
+async def purge_command(interaction: Interaction, number: int):
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("Admin only.", ephemeral=True)
 
+    if number <= 0:
+        return await interaction.response.send_message("Please specify a positive number of messages to purge.", ephemeral=True)
 
+    deleted = await interaction.channel.purge(limit=number)
+    await interaction.response.send_message(f"Purged {len(deleted)} messages.", ephemeral=True)
 
-
-
+# Run the bot
 bot.run(TOKEN)
