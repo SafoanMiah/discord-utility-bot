@@ -404,6 +404,7 @@ async def on_ready():
     print(f"Logged in as {bot.user}")
     cleanup_empty_vcs.start()
     repost_stickies.start()
+    repost_sticky_help.start()
     try:
         synced = await bot.tree.sync()
         print(f"Slash commands synced: {len(synced)}")
@@ -438,8 +439,7 @@ async def on_message(message: discord.Message):
 # --- Slash Commands ---
 
 
-@bot.tree.command(name="help", description="Show all bot commands and features.")
-async def help_command(interaction: Interaction):
+def build_help_embed() -> discord.Embed:
     embed = discord.Embed(title="Bot Commands", color=0x2ECC71)
     embed.add_field(
         name="🎙️ Voice Channels",
@@ -475,7 +475,68 @@ async def help_command(interaction: Interaction):
         value="Empty VCs are cleaned every 5 mins\nStickies reposted to stay visible",
         inline=False,
     )
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    return embed
+
+
+@bot.tree.command(name="help", description="Show all bot commands and features.")
+async def help_command(interaction: Interaction):
+    await interaction.response.send_message(embed=build_help_embed(), ephemeral=True)
+
+
+# Sticky help data: {channel_id: message_id}
+sticky_help_data = {}
+
+
+@bot.tree.command(
+    name="stickhelp",
+    description="Admin-only: Post a sticky help embed that reposts every 10 mins.",
+)
+async def stickhelp_command(interaction: Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("Admin only.", ephemeral=True)
+
+    channel_id = interaction.channel_id
+
+    # If already active in this channel, remove it
+    if channel_id in sticky_help_data:
+        old_id = sticky_help_data.pop(channel_id)
+        if old_id:
+            try:
+                old_msg = await interaction.channel.fetch_message(old_id)
+                await old_msg.delete()
+            except discord.NotFound:
+                pass
+        await interaction.response.send_message(
+            "Sticky help removed from this channel.", ephemeral=True
+        )
+        return
+
+    # Post the help embed and track it
+    msg = await interaction.channel.send(embed=build_help_embed())
+    sticky_help_data[channel_id] = msg.id
+    await interaction.response.send_message(
+        "Sticky help set! It will repost every 10 mins to stay visible.", ephemeral=True
+    )
+
+
+@tasks.loop(minutes=10)
+async def repost_sticky_help():
+    """Reposts the help embed if it's not the last message in the channel."""
+    for channel_id, msg_id in list(sticky_help_data.items()):
+        channel = bot.get_channel(channel_id)
+        if not channel:
+            continue
+        if channel.last_message_id != msg_id:
+            # Delete old one
+            if msg_id:
+                try:
+                    old_msg = await channel.fetch_message(msg_id)
+                    await old_msg.delete()
+                except discord.NotFound:
+                    pass
+            # Repost
+            msg = await channel.send(embed=build_help_embed())
+            sticky_help_data[channel_id] = msg.id
 
 
 @bot.tree.command(
