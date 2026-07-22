@@ -30,7 +30,13 @@ COMMON_TZS = [
     "Asia/Kolkata", "Asia/Dubai", "Asia/Singapore", "Australia/Sydney",
     "Pacific/Auckland", "UTC",
 ]
-UTC_NOTE = "Times shown in UTC. Set yours with `/timezone set` for local time."
+UTC_NOTE = (
+    "🕐 Times on this chart are in **UTC** because you haven't set a timezone.\n"
+    "To see everything in your local time:\n"
+    "1. Type `/timezone set`\n"
+    "2. In the **zone** box, start typing your city or region (e.g. `london`)\n"
+    "3. Pick yours from the list — it's saved, all future charts use it."
+)
 
 storage = Storage(config.DB_PATH)
 
@@ -269,59 +275,78 @@ async def tz_clear(interaction: discord.Interaction) -> None:
 client.tree.add_command(tz_group)
 
 
-# -- /activity ----------------------------------------------------------------
+# -- /stats -------------------------------------------------------------------
 
-@client.tree.command(name="activity", description="Activity charts for a member")
+stats_group = app_commands.Group(
+    name="stats", description="Activity charts and stat cards", guild_only=True
+)
+
+
+async def _send_chart(
+    interaction: discord.Interaction, png, filename: str, note: str | None
+) -> None:
+    """Post the chart publicly; if the requester has no timezone set, follow
+    with an ephemeral how-to only they can see."""
+    await interaction.followup.send(file=discord.File(png, filename=filename))
+    if note:
+        await interaction.followup.send(note, ephemeral=True)
+
+
+async def _target_data(
+    interaction: discord.Interaction, user: discord.Member
+) -> tuple[list[int], list[tuple[int, int]]] | None:
+    """Defer, validate the target, and fetch their rows. Returns None (with
+    the response already sent) when there's nothing to render."""
+    await interaction.response.defer()
+    if user.bot:
+        await interaction.followup.send("Bots aren't tracked.")
+        return None
+    if await storage.is_opted_out(user.id):
+        await interaction.followup.send("No data — this user has opted out.")
+        return None
+    msgs, sessions = await _fetch_activity(user.id, interaction.guild_id)
+    if not msgs and not sessions:
+        await interaction.followup.send(f"No activity recorded for **{user.display_name}** yet.")
+        return None
+    return msgs, sessions
+
+
+@stats_group.command(name="activity", description="Activity charts for a member")
 @app_commands.describe(user="Member to view", day="Only show one weekday")
 @app_commands.choices(day=[app_commands.Choice(name=d, value=i) for i, d in enumerate(WEEKDAYS)])
-@app_commands.guild_only()
-async def activity_cmd(
+async def stats_activity(
     interaction: discord.Interaction,
     user: discord.Member,
     day: app_commands.Choice[int] | None = None,
 ) -> None:
-    await interaction.response.defer()
-    if user.bot:
-        await interaction.followup.send("Bots aren't tracked.")
+    data = await _target_data(interaction, user)
+    if data is None:
         return
-    if await storage.is_opted_out(user.id):
-        await interaction.followup.send("No data — this user has opted out.")
-        return
-    msgs, sessions = await _fetch_activity(user.id, interaction.guild_id)
-    if not msgs and not sessions:
-        await interaction.followup.send(f"No activity recorded for **{user.display_name}** yet.")
-        return
+    msgs, sessions = data
     tz, tz_label, note = await _requester_tz(interaction.user.id)
     day_index = day.value if day is not None else None
     png = await asyncio.to_thread(
         _build_activity_png, user.display_name, msgs, sessions, tz, tz_label, day_index
     )
-    await interaction.followup.send(content=note, file=discord.File(png, filename="activity.png"))
+    await _send_chart(interaction, png, "activity.png", note)
 
 
-# -- /stats -------------------------------------------------------------------
-
-@client.tree.command(name="stats", description="Stats card for a member")
+@stats_group.command(name="card", description="Stats card for a member")
 @app_commands.describe(user="Member to view")
-@app_commands.guild_only()
-async def stats_cmd(interaction: discord.Interaction, user: discord.Member) -> None:
-    await interaction.response.defer()
-    if user.bot:
-        await interaction.followup.send("Bots aren't tracked.")
+async def stats_card(interaction: discord.Interaction, user: discord.Member) -> None:
+    data = await _target_data(interaction, user)
+    if data is None:
         return
-    if await storage.is_opted_out(user.id):
-        await interaction.followup.send("No data — this user has opted out.")
-        return
-    msgs, sessions = await _fetch_activity(user.id, interaction.guild_id)
-    if not msgs and not sessions:
-        await interaction.followup.send(f"No activity recorded for **{user.display_name}** yet.")
-        return
+    msgs, sessions = data
     tz, tz_label, note = await _requester_tz(interaction.user.id)
     joined = user.joined_at.date() if user.joined_at else None
     png = await asyncio.to_thread(
         _build_stats_png, user.display_name, msgs, sessions, tz, tz_label, joined
     )
-    await interaction.followup.send(content=note, file=discord.File(png, filename="stats.png"))
+    await _send_chart(interaction, png, "stats.png", note)
+
+
+client.tree.add_command(stats_group)
 
 
 # -- /privacy -----------------------------------------------------------------

@@ -51,11 +51,12 @@ Run: `python -m iris.bot`
 - `/timezone set <zone>` · `/timezone show` · `/timezone clear` — IANA zone with
   autocomplete; ephemeral text replies. (The spec's bare `/timezone` became
   `/timezone show` — Discord can't invoke a command group with no subcommand.)
-- `/activity <user> [day]` — composite PNG: messages/hour, voice minutes/hour,
-  and day-of-week mini-panels; with `day`, both hour panels filtered to that
-  weekday. All times in the **requester's** timezone.
-- `/stats <user>` — stats card PNG: totals, most active hour/day, voice-per-message,
-  session stats, tracked-since vs joined-server, last active, active days.
+- `/stats activity <user> [day]` — composite PNG: messages/hour, voice
+  minutes/hour, and day-of-week mini-panels; with `day`, both hour panels
+  filtered to that weekday. All times in the **requester's** timezone.
+- `/stats card <user>` — stats card PNG: totals, most active hour/day,
+  voice-per-message, session stats, tracked-since vs joined-server, last
+  active, active days.
 - `/privacy optout` — stop logging **and delete** recorded history. `/privacy optin`
   resumes logging (deleted data is not restored).
 - `/backlog chats` (server managers only) — scans every text channel's full
