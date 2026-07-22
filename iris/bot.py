@@ -5,11 +5,16 @@ Run from the repo root:  python -m iris.bot
 from __future__ import annotations
 
 import asyncio
+import gzip
 import logging
 import re
+import shutil
 import signal
+import tempfile
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timezone
+from datetime import time as dtime
+from pathlib import Path
 from zoneinfo import ZoneInfo, available_timezones
 
 import discord
@@ -129,6 +134,8 @@ class IrisClient(discord.Client):
             log.info("Snapshotted %d member(s) already in voice", opened)
         if not heartbeat_loop.is_running():
             heartbeat_loop.start()
+        if config.BACKUP_CHANNEL_ID and not backup_loop.is_running():
+            backup_loop.start()
 
     def members_in_voice(self) -> list[int]:
         return [
@@ -146,6 +153,73 @@ client = IrisClient()
 @tasks.loop(seconds=config.HEARTBEAT_SECONDS)
 async def heartbeat_loop() -> None:
     await storage.heartbeat(client.members_in_voice(), int(time.time()))
+
+
+# -- database backups ----------------------------------------------------------
+# Free hosts can vanish or wipe files; posting the db to a private Discord
+# channel means the data survives anything short of Discord itself.
+
+def _gzip_file(src: Path, dest: Path) -> None:
+    with open(src, "rb") as fin, gzip.open(dest, "wb") as fout:
+        shutil.copyfileobj(fin, fout)
+
+
+async def _make_backup_file() -> Path:
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H%M")
+    raw = Path(tempfile.gettempdir()) / f"iris-{stamp}.db"
+    raw.unlink(missing_ok=True)  # VACUUM INTO refuses to overwrite
+    await storage.backup_to(str(raw))
+    packed = raw.with_suffix(".db.gz")
+    await asyncio.to_thread(_gzip_file, raw, packed)
+    raw.unlink()
+    return packed
+
+
+async def _post_backup(reason: str) -> discord.Message | None:
+    channel = client.get_channel(config.BACKUP_CHANNEL_ID)
+    if channel is None:
+        log.warning("BACKUP_CHANNEL_ID %s is not a channel I can see", config.BACKUP_CHANNEL_ID)
+        return None
+    packed = await _make_backup_file()
+    try:
+        return await channel.send(
+            f"🗃️ Database backup ({reason}). To restore: download, un-gzip, "
+            "and start the bot with it as `iris.db`.",
+            file=discord.File(packed),
+        )
+    finally:
+        packed.unlink(missing_ok=True)
+
+
+@tasks.loop(time=dtime(hour=4, tzinfo=timezone.utc))
+async def backup_loop() -> None:
+    try:
+        await _post_backup("daily")
+    except Exception:
+        log.exception("Daily backup failed")
+
+
+@client.tree.command(name="backup", description="Post a database backup to the backup channel now")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.guild_only()
+async def backup_cmd(interaction: discord.Interaction) -> None:
+    if not config.BACKUP_CHANNEL_ID:
+        await interaction.response.send_message(
+            "No backup channel configured. Add `BACKUP_CHANNEL_ID=<channel id>` to the "
+            ".env file (right-click a private channel with developer mode on to copy "
+            "its id) and restart.",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.defer(ephemeral=True)
+    message = await _post_backup("manual")
+    if message is None:
+        await interaction.followup.send(
+            "I can't see the configured backup channel — check `BACKUP_CHANNEL_ID` "
+            "and my permissions there.", ephemeral=True,
+        )
+    else:
+        await interaction.followup.send(f"Backup posted: {message.jump_url}", ephemeral=True)
 
 
 # -- shared helpers -----------------------------------------------------------

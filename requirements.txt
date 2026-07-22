@@ -1,0 +1,2 @@
+# Kept at the repo root so hosting panels auto-install dependencies.
+-r iris/requirements.txt

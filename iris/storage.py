@@ -51,6 +51,12 @@ class Storage:
         assert self._db is not None, "Storage.open() not called"
         return self._db
 
+    async def backup_to(self, path: str) -> None:
+        """Write a consistent point-in-time snapshot of the whole database to
+        `path`. Safe to run while the bot is live (VACUUM INTO takes its own
+        read transaction and produces a single self-contained file)."""
+        await self.db.execute("VACUUM INTO ?", (path,))
+
     # -- timezones ----------------------------------------------------------
 
     async def set_timezone(self, user_id: int, tz: str) -> None:

@@ -1,99 +1,85 @@
-# Iris — Discord activity & timekeeping bot
+# Iris
 
-Iris logs per-user chat and voice-channel activity for one private server,
-stores timezones, and renders activity/stat views as styled PNG images.
-No gamification, no message content stored — metadata only.
+A Discord bot for our server. It keeps track of when people chat and hang out
+in voice, then turns that into nice looking charts. It never stores what
+anyone writes, only the times. No XP, no levels, just stats.
 
-## Layout
+## Running it
 
-```
-iris/
-  bot.py         # entry point: client, intents, event handlers, slash commands
-  storage.py     # repository: the ONLY module that talks to the DB (SQLite via aiosqlite)
-  analysis.py    # pure functions: rows + tz -> bucketed data. No I/O.
-  charts.py      # matplotlib rendering -> PNG bytes
-  theme.py       # rcParams, palette, styled figure factory
-  config.py      # env vars, constants
-  schema.sql     # table + index DDL
-  fonts/         # bundled Inter .ttf (OFL licence included)
-tests/           # unit tests for analysis + storage
-preview.py       # renders sample PNGs with fake data (visual iteration, no Discord needed)
-```
-
-Nothing downstream touches storage directly — swapping SQLite for Postgres
-later means reimplementing `storage.py` only.
-
-## Setup
+You need Python 3.11 or newer.
 
 ```
 python -m venv .venv
-.venv/bin/pip install -r iris/requirements.txt
+.venv/Scripts/pip install -r iris/requirements.txt   (on Linux: .venv/bin/pip)
+python -m iris.bot
 ```
 
-Config via env vars (a `.env` file in the repo root is also read):
+Put your settings in a `.env` file in the repo root:
 
-| Var | Meaning |
-|---|---|
-| `DISCORD_TOKEN` | bot token (`DISCORD_BOT_TOKEN` also accepted) |
-| `DB_PATH` | SQLite file path (default `./iris.db`) |
-| `GUILD_ID` | optional — register commands to one guild for instant sync during dev |
+```
+DISCORD_TOKEN=your-bot-token
+GUILD_ID=your-server-id
+BACKUP_CHANNEL_ID=a-private-channel-id
+```
 
-In the Discord Developer Portal enable **both** privileged intents
-(Bot → Privileged Gateway Intents): **Server Members** (join dates, voice
-snapshots) and **Message Content**. The latter exists for exactly one reason:
-Discord hides other bots' *embeds* without it, and `/backlog vc` parses
-CircleBot's log embeds. Iris never reads or stores anyone's message text.
+`GUILD_ID` is optional but makes slash commands show up instantly instead of
+taking up to an hour. `BACKUP_CHANNEL_ID` is optional too: when set, Iris
+posts a compressed copy of its database to that channel every day (and on
+`/backup`), so even if the host dies you can restore from the latest file.
+Make it a private channel, and get the id by right-clicking the channel with
+Discord developer mode turned on.
 
-Run: `python -m iris.bot`
+In the Discord Developer Portal (your app, then Bot, then Privileged Gateway
+Intents) turn on **Server Members** and **Message Content**. Message Content
+sounds scary but it's only there because Discord hides other bots' embeds
+without it, and `/backlog vc` needs to read CircleBot's log embeds. Iris does
+not read or store anyone's actual messages.
 
 ## Commands
 
-- `/timezone set <zone>` · `/timezone show` · `/timezone clear` — IANA zone with
-  autocomplete; ephemeral text replies. (The spec's bare `/timezone` became
-  `/timezone show` — Discord can't invoke a command group with no subcommand.)
-- `/stats activity <user> [day]` — composite PNG: messages/hour, voice
-  minutes/hour, and day-of-week mini-panels; with `day`, both hour panels
-  filtered to that weekday. All times in the **requester's** timezone.
-- `/stats card <user>` — stats card PNG: totals, most active hour/day,
-  voice-per-message, session stats, tracked-since vs joined-server, last
-  active, active days.
-- `/privacy optout` — stop logging **and delete** recorded history. `/privacy optin`
-  resumes logging (deleted data is not restored).
-- `/backlog chats` (server managers only) — scans every text channel's full
-  history and logs past message activity. Safe to re-run: rows are deduplicated
-  by Discord message id. Bots, opted-out members, and system messages (joins,
-  boosts, pins) are excluded, exactly as in live capture. Threads/forum posts
-  aren't scanned.
-- `/backlog vc <channel>` (server managers only) — voice has no history API,
-  but if CircleBot (circlebot.xyz) logs to a channel, this reads its
-  join/leave embeds and rebuilds past sessions from them. Joins pair with
-  leaves per user (a join while one is open counts as a channel move);
-  unpaired events from log gaps are dropped rather than guessed. Imports are
-  tagged `source='backlog'`, so re-running replaces the previous import, and
-  everything is capped at the moment Iris's own live voice capture began —
-  nothing is ever counted twice. Requires the Message Content intent (see
-  setup) to read the embeds.
+| Command | What it does |
+|---|---|
+| `/stats activity @user` | Charts of when someone chats and sits in voice. Add a day to see just Fridays etc. |
+| `/stats card @user` | A stat card: totals, most active hour, longest voice session and so on |
+| `/timezone set` | Set your timezone, all charts then show in your local time |
+| `/timezone show` / `clear` | Check or remove it |
+| `/privacy optout` | Stop being tracked and delete everything Iris has on you |
+| `/privacy optin` | Start being tracked again (deleted data stays deleted) |
+| `/backlog chats` | Reads all channel history and fills in past message activity (managers only) |
+| `/backlog vc #channel` | Rebuilds past voice sessions from CircleBot's logs in that channel (managers only) |
+| `/backup` | Posts a database backup to the backup channel right now (managers only) |
 
-Notes on semantics:
-- "Voice per message" is total VC time ÷ total messages.
-- "Most active hour/day" combines chat and voice, each normalised to its own
-  total so heavy chatters and heavy VC users weigh equally.
-- "Tracked since" is the earliest logged event (Iris only knows from when it
-  started logging); "Joined server" is the real Discord join date.
+Charts always use the timezone of whoever ran the command. If you haven't set
+one, they're in UTC and the bot privately tells you how to set it.
 
-## Reliability model
+Bots are never tracked. Neither are people who opted out, including in
+backfills.
 
-- Voice time is stored as raw sessions (start/end epoch UTC), never
-  pre-bucketed — local-hour bucketing happens at read time after timezone
-  conversion, so DST and fractional offsets can't misassign minutes.
-- A 60 s heartbeat stamps open sessions; on startup, sessions left open by a
-  crash are closed at their last heartbeat (≤ 60 s data loss), then members
-  currently in voice are re-snapshotted.
-- On SIGTERM (systemd stop/restart) all open sessions are closed at "now".
+## Good to know
 
-## Deployment (Oracle Always Free ARM VM or similar)
+- Everything is stored as UTC timestamps in one SQLite file (`iris.db`).
+  Back that file up now and then, it's the whole database.
+- If the bot crashes, voice time still gets saved. It checkpoints every
+  minute, so worst case you lose 60 seconds.
+- Both `/backlog` commands are safe to run again, they skip anything already
+  recorded instead of counting it twice.
+- Only run one copy of the bot at a time.
 
-matplotlib wants real RAM — don't use 128 MB free panels. Example systemd unit:
+## Hosting
+
+Any always-on box with about 1 GB of RAM works. Options, best first:
+
+- A VM you control (Oracle Cloud Always Free, Google Cloud e2-micro, a
+  Raspberry Pi at home). Most reliable.
+- A free bot hosting panel (bot-hosting.net, Wispbyte and similar). Fine for
+  a friends server, but set `BACKUP_CHANNEL_ID` first: free panels can wipe
+  files or disappear, and the daily Discord backup is what makes that
+  survivable. `main.py` at the repo root exists so panels have a file to run.
+
+To restore from a backup: download the newest `iris-*.db.gz` from the backup
+channel, un-gzip it, name it `iris.db`, put it next to the bot, start it.
+
+On a Linux VM, run it under systemd so it restarts itself:
 
 ```ini
 [Unit]
@@ -106,16 +92,17 @@ WorkingDirectory=/opt/iris
 ExecStart=/opt/iris/.venv/bin/python -m iris.bot
 Restart=on-failure
 RestartSec=5
-Environment=DISCORD_TOKEN=...
-Environment=DB_PATH=/opt/iris/iris.db
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-Back up the SQLite file nightly (`cron` copy) or continuously with litestream.
+## For development
 
-## Dev tools
-
-- `python preview.py` renders sample charts to `preview_out/` with fake data.
-- `python -m pytest tests/` runs the analysis/storage unit tests.
+- `python preview.py` renders sample charts with fake data into `preview_out/`
+  so you can tweak the look without touching Discord.
+- `python -m pytest tests/` runs the tests.
+- Layout: `bot.py` is Discord stuff, `storage.py` is the only file that talks
+  to the database, `analysis.py` does the number crunching, `charts.py` and
+  `theme.py` draw the images. If you ever move to Postgres you only rewrite
+  `storage.py`.

@@ -99,4 +99,12 @@ async def _flow(db_path: str) -> None:
     assert not await s.is_opted_out(1)
     assert await s.get_opted_out_ids() == set()
 
+    # backup produces a self-contained, openable snapshot
+    backup_path = db_path + ".backup"
+    await s.backup_to(backup_path)
+    b = Storage(backup_path)
+    await b.open()
+    assert len(await b.get_messages(2, 10)) == 1
+    await b.close()
+
     await s.close()
