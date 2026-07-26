@@ -8,6 +8,69 @@ def test_storage_flow(tmp_path):
     asyncio.run(_flow(str(tmp_path / "test.db")))
 
 
+def test_game_session_flow(tmp_path):
+    asyncio.run(_game_flow(str(tmp_path / "games.db")))
+
+
+async def _game_flow(db_path: str) -> None:
+    s = Storage(db_path)
+    await s.open()
+
+    # open sessions are invisible to reads until closed
+    await s.open_game_session(1, 10, "VALORANT", 1000)
+    assert await s.get_game_sessions(1, 10) == []
+    assert await s.get_open_game_sessions() == [(1, 10, "VALORANT", 1000)]
+    await s.close_game_session(1, 10, "VALORANT", 1600)
+    assert await s.get_game_sessions(1, 10) == [("VALORANT", 1000, 1600)]
+
+    # two games at once are tracked independently
+    await s.open_game_session(1, 10, "VALORANT", 2000)
+    await s.open_game_session(1, 10, "Spotify-less: Deep Rock", 2000)
+    assert len(await s.get_open_game_sessions()) == 2
+    await s.close_game_session(1, 10, "VALORANT", 2500)
+    # the other game is still open, so still hidden from reads
+    assert await s.get_game_sessions(1, 10) == [("VALORANT", 1000, 1600),
+                                                ("VALORANT", 2000, 2500)]
+
+    # heartbeat + crash recovery: reconcile closes at last heartbeat
+    await s.heartbeat_games([(1, "Deep Rock")], 2600)  # non-matching game: no-op
+    await s.heartbeat_games([(1, "Spotify-less: Deep Rock")], 2700)
+    assert await s.reconcile_open_game_sessions(9999) == 1
+    assert ("Spotify-less: Deep Rock", 2000, 2700) in await s.get_game_sessions(1, 10)
+
+    # double-open defence: re-opening the same game closes the stale row at its
+    # last heartbeat, leaving exactly one open row (and one short closed one)
+    await s.open_game_session(2, 10, "osu!", 3000)
+    await s.heartbeat_games([(2, "osu!")], 3050)
+    await s.open_game_session(2, 10, "osu!", 3100)
+    open_rows = await s.get_open_game_sessions()
+    assert len(open_rows) == 1 and open_rows[0][0] == 2
+    assert ("osu!", 3000, 3050) in await s.get_game_sessions(2, 10)
+
+    # graceful shutdown closes everything still open at "now"
+    await s.close_all_open_game_sessions(3200)
+    assert await s.get_open_game_sessions() == []
+    assert ("osu!", 3100, 3200) in await s.get_game_sessions(2, 10)
+
+    # guild scoping + since filter
+    await s.open_game_session(1, 99, "VALORANT", 4000)
+    await s.close_game_session(1, 99, "VALORANT", 4100)
+    assert await s.get_game_sessions(1, 99) == [("VALORANT", 4000, 4100)]
+    # since filters on end_utc; the 1000-1600 session drops out
+    assert set(await s.get_game_sessions(1, 10, since=2000)) == {
+        ("VALORANT", 2000, 2500), ("Spotify-less: Deep Rock", 2000, 2700)
+    }
+
+    # optout purges game history too, across guilds, leaving others untouched
+    before_optout = await s.get_game_sessions(2, 10)
+    await s.set_optout(1)
+    assert await s.get_game_sessions(1, 10) == []
+    assert await s.get_game_sessions(1, 99) == []
+    assert await s.get_game_sessions(2, 10) == before_optout
+
+    await s.close()
+
+
 async def _flow(db_path: str) -> None:
     s = Storage(db_path)
     await s.open()

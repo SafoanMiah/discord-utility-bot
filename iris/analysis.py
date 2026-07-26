@@ -83,6 +83,22 @@ def active_dates(
     return dates
 
 
+def game_totals(
+    sessions: Iterable[tuple[str, int, int]]
+) -> list[tuple[str, int, int]]:
+    """Collapse (game, start_utc, end_utc) sessions into per-game totals:
+    (game, total_seconds, session_count), sorted by time played descending
+    (ties broken alphabetically). Negative-length sessions clamp to zero."""
+    seconds: dict[str, int] = {}
+    counts: dict[str, int] = {}
+    for game, start, end in sessions:
+        seconds[game] = seconds.get(game, 0) + max(end - start, 0)
+        counts[game] = counts.get(game, 0) + 1
+    totals = [(game, seconds[game], counts[game]) for game in seconds]
+    totals.sort(key=lambda row: (-row[1], row[0]))
+    return totals
+
+
 def _argmax_combined_share(a: Sequence[float], b: Sequence[float]) -> int | None:
     """Index where combined activity peaks. Each series is normalised to its
     own total first, so a heavy VC user and a heavy chatter weigh equally."""

@@ -115,6 +115,37 @@ def test_summary_fields():
     assert abs(s["vc_seconds_per_message"] - 2.5 * 3600 / 3) < 1e-9
 
 
+# -- game totals --------------------------------------------------------------
+
+def test_game_totals_sums_and_sorts_by_time():
+    sessions = [
+        ("VALORANT", 0, 3600),          # 1h
+        ("osu!", 0, 600),               # 10m
+        ("VALORANT", 10_000, 12_700),   # +45m -> 1h45m total, 2 sessions
+    ]
+    assert analysis.game_totals(sessions) == [
+        ("VALORANT", 6300, 2),
+        ("osu!", 600, 1),
+    ]
+
+
+def test_game_totals_clamps_negatives_and_breaks_ties_alphabetically():
+    sessions = [
+        ("Zed", 100, 1_100),      # 1000s
+        ("Abyss", 0, 1_000),      # 1000s — ties Zed, sorts first by name
+        ("Broken", 500, 200),     # negative length -> clamped to 0
+    ]
+    assert analysis.game_totals(sessions) == [
+        ("Abyss", 1000, 1),
+        ("Zed", 1000, 1),
+        ("Broken", 0, 1),
+    ]
+
+
+def test_game_totals_empty():
+    assert analysis.game_totals([]) == []
+
+
 def test_reconstruct_sessions_pairs_joins_and_leaves():
     events = [
         (1000, 1, 50, "join"),

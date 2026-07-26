@@ -160,6 +160,56 @@ def render_activity_day(name: str, subtitle: str,
     return _to_png(fig)
 
 
+def render_games(name: str, subtitle: str,
+                 games: Sequence[tuple[str, float, int]]) -> io.BytesIO:
+    """/games: horizontal bars of most-played games by time. Rows are
+    (game_name, total_seconds, session_count), already sorted desc. Horizontal
+    because game names are long labels, not something that fits an x-axis."""
+    top = list(games[:10])
+    if not top:
+        fig = theme.new_figure(9.2, 3.6)
+        theme.header(fig, name, subtitle)
+        _empty_panel(fig.add_axes([0.07, 0.1, 0.88, 0.5]),
+                     "Games · time played", "No game activity yet")
+        return _to_png(fig)
+
+    top = top[::-1]  # barh draws bottom-up; reverse so the biggest lands on top
+    labels = [(g[:22] + "…") if len(g) > 23 else g for g, _, _ in top]
+    seconds = [s for _, s, _ in top]
+    hours = [s / 3600 for s in seconds]
+
+    n = len(top)
+    height = 2.1 + 0.5 * n
+    fig = theme.new_figure(9.2, height)
+    theme.header(fig, name, subtitle)
+
+    top_frac = 1 - 1.5 / height
+    ax = fig.add_axes([0.26, 0.85 / height, 0.70, top_frac - 0.85 / height])
+    ax.set_title("Games · hours played")
+
+    for side in ("top", "right", "left"):
+        ax.spines[side].set_visible(False)
+    ax.spines["bottom"].set_color(theme.GRID)
+    ax.spines["bottom"].set_linewidth(1.0)
+    ax.tick_params(length=0)
+    ax.set_axisbelow(True)
+    ax.grid(axis="x", color=theme.GRID, linewidth=1.0, alpha=0.9)
+    ax.grid(visible=False, axis="y")
+
+    ax.barh(range(n), hours, height=0.62, color=theme.SECONDARY, zorder=3)
+    ax.set_yticks(range(n), labels)
+    ax.set_ylim(-0.7, n - 0.3)
+    ax.set_xlim(0, max(hours) * 1.16)
+    ax.xaxis.set_major_locator(MaxNLocator(nbins=5))
+    ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: _fmt_hours(v) if v else "0"))
+
+    for i, secs in enumerate(seconds):
+        ax.annotate(fmt_duration(secs), (hours[i], i), xytext=(6, 0),
+                    textcoords="offset points", va="center", ha="left",
+                    color=theme.TEXT, fontsize=9.5, fontweight="medium", zorder=4)
+    return _to_png(fig)
+
+
 def render_stats_card(name: str, subtitle: str,
                       hero: Sequence[tuple[str, str]],
                       details: Sequence[tuple[str, str]]) -> io.BytesIO:

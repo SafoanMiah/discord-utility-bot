@@ -1,8 +1,9 @@
 # Iris
 
-A Discord bot for our server. It keeps track of when people chat and hang out
-in voice, then turns that into nice looking charts. It never stores what
-anyone writes, only the times. No XP, no levels, just stats.
+A Discord bot for our server. It keeps track of when people chat, hang out in
+voice, and what games they play, then turns that into nice looking charts. It
+never stores what anyone writes, only the times (and, for games, the name
+Discord shows — e.g. "VALORANT"). No XP, no levels, just stats.
 
 ## Running it
 
@@ -30,10 +31,11 @@ Make it a private channel, and get the id by right-clicking the channel with
 Discord developer mode turned on.
 
 In the Discord Developer Portal (your app, then Bot, then Privileged Gateway
-Intents) turn on **Server Members** and **Message Content**. Message Content
-sounds scary but it's only there because Discord hides other bots' embeds
-without it, and `/backlog vc` needs to read CircleBot's log embeds. Iris does
-not read or store anyone's actual messages.
+Intents) turn on **Server Members**, **Presence**, and **Message Content**.
+Presence is what lets Iris see when someone starts and stops playing a game.
+Message Content sounds scary but it's only there because Discord hides other
+bots' embeds without it, and `/backlog vc` needs to read CircleBot's log
+embeds. Iris does not read or store anyone's actual messages.
 
 ## Commands
 
@@ -41,6 +43,7 @@ not read or store anyone's actual messages.
 |---|---|
 | `/stats activity @user` | Charts of when someone chats and sits in voice. Add a day to see just Fridays etc. |
 | `/stats card @user` | A stat card: totals, most active hour, longest voice session and so on |
+| `/stats games @user` | Their most-played games, ranked by time played |
 | `/timezone set` | Set your timezone, all charts then show in your local time |
 | `/timezone show` / `clear` | Check or remove it |
 | `/privacy optout` | Stop being tracked and delete everything Iris has on you |
@@ -63,6 +66,9 @@ backfills.
   minute, so worst case you lose 60 seconds.
 - Both `/backlog` commands are safe to run again, they skip anything already
   recorded instead of counting it twice.
+- Game activity can't be backfilled — Discord keeps no history of it, so it
+  only starts counting once Iris is running with the Presence intent on. Like
+  voice, open game sessions checkpoint every minute and survive crashes.
 - Only run one copy of the bot at a time.
 
 ## Hosting

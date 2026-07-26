@@ -221,6 +221,91 @@ class Storage:
         ) as cur:
             return await cur.fetchall()
 
+    # -- game presence ------------------------------------------------------
+    # Mirrors the voice lifecycle exactly, keyed by (user, guild, game) so a
+    # member running two games at once gets a session for each.
+
+    async def open_game_session(
+        self, user_id: int, guild_id: int, game: str, start_utc: int
+    ) -> None:
+        # Defensive: a missed "stopped playing" would otherwise leave two open
+        # sessions for the same game. Close any stale one at its last heartbeat.
+        await self.db.execute(
+            "UPDATE game_sessions"
+            " SET end_utc = COALESCE(last_heartbeat_utc, start_utc)"
+            " WHERE user_id = ? AND guild_id = ? AND game = ? AND end_utc IS NULL",
+            (user_id, guild_id, game),
+        )
+        await self.db.execute(
+            "INSERT INTO game_sessions (user_id, guild_id, game, start_utc)"
+            " VALUES (?, ?, ?, ?)",
+            (user_id, guild_id, game, start_utc),
+        )
+        await self.db.commit()
+
+    async def close_game_session(
+        self, user_id: int, guild_id: int, game: str, end_utc: int
+    ) -> None:
+        await self.db.execute(
+            "UPDATE game_sessions SET end_utc = ?"
+            " WHERE user_id = ? AND guild_id = ? AND game = ? AND end_utc IS NULL",
+            (end_utc, user_id, guild_id, game),
+        )
+        await self.db.commit()
+
+    async def heartbeat_games(self, active: list[tuple[int, str]], ts: int) -> None:
+        """Bump last_heartbeat_utc for each (user_id, game) still being played."""
+        if not active:
+            return
+        await self.db.executemany(
+            "UPDATE game_sessions SET last_heartbeat_utc = ?"
+            " WHERE end_utc IS NULL AND user_id = ? AND game = ?",
+            [(ts, user_id, game) for user_id, game in active],
+        )
+        await self.db.commit()
+
+    async def reconcile_open_game_sessions(self, now: int) -> int:
+        """Close game sessions left open by a previous run at their last
+        heartbeat (start time if they never beat). Returns the number closed."""
+        cur = await self.db.execute(
+            "UPDATE game_sessions"
+            " SET end_utc = MIN(COALESCE(last_heartbeat_utc, start_utc), ?)"
+            " WHERE end_utc IS NULL",
+            (now,),
+        )
+        await self.db.commit()
+        return cur.rowcount
+
+    async def close_all_open_game_sessions(self, now: int) -> None:
+        """Graceful shutdown: everyone currently playing "stops" at `now`."""
+        await self.db.execute(
+            "UPDATE game_sessions SET end_utc = ? WHERE end_utc IS NULL", (now,)
+        )
+        await self.db.commit()
+
+    async def get_open_game_sessions(self) -> list[tuple[int, int, str, int]]:
+        """Rows of (user_id, guild_id, game, start_utc) still open."""
+        async with self.db.execute(
+            "SELECT user_id, guild_id, game, start_utc"
+            " FROM game_sessions WHERE end_utc IS NULL"
+        ) as cur:
+            return await cur.fetchall()
+
+    async def get_game_sessions(
+        self, user_id: int, guild_id: int, since: int | None = None
+    ) -> list[tuple[str, int, int]]:
+        """Rows of (game, start_utc, end_utc). Closed sessions only."""
+        sql = (
+            "SELECT game, start_utc, end_utc FROM game_sessions"
+            " WHERE user_id = ? AND guild_id = ? AND end_utc IS NOT NULL"
+        )
+        params: list[int] = [user_id, guild_id]
+        if since is not None:
+            sql += " AND end_utc >= ?"
+            params.append(since)
+        async with self.db.execute(sql + " ORDER BY start_utc", params) as cur:
+            return await cur.fetchall()
+
     # -- reads --------------------------------------------------------------
 
     async def get_messages(
@@ -261,6 +346,7 @@ class Storage:
         )
         await self.db.execute("DELETE FROM messages WHERE user_id = ?", (user_id,))
         await self.db.execute("DELETE FROM voice_sessions WHERE user_id = ?", (user_id,))
+        await self.db.execute("DELETE FROM game_sessions WHERE user_id = ?", (user_id,))
         await self.db.commit()
 
     async def set_optin(self, user_id: int) -> None:

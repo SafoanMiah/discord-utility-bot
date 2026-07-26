@@ -7,10 +7,20 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from iris.bot import _build_activity_png, _build_stats_png
+from iris.bot import _build_activity_png, _build_games_png, _build_stats_png
 
 OUT = Path(__file__).parent / "preview_out"
 UTC = timezone.utc
+
+# (name, weight, typical session minutes) for fake game presence.
+FAKE_GAMES = [
+    ("VALORANT", 6, (30, 120)),
+    ("League of Legends", 4, (25, 90)),
+    ("Counter-Strike 2", 3, (20, 100)),
+    ("Deep Rock Galactic", 2, (30, 150)),
+    ("osu!", 2, (10, 45)),
+    ("Baldur's Gate 3", 1, (60, 240)),
+]
 
 # Evening-skewed hour weights (index = UTC hour).
 HOUR_WEIGHTS = [2, 1, 0.5, 0.3, 0.2, 0.3, 0.5, 1, 2, 3, 3, 3.5,
@@ -35,6 +45,21 @@ def fake_data(days: int = 120) -> tuple[list[int], list[tuple[int, int]]]:
     return msgs, sessions
 
 
+def fake_games(days: int = 120) -> list[tuple[str, int, int]]:
+    random.seed(11)
+    end = int(datetime(2026, 7, 22, tzinfo=UTC).timestamp())
+    names, weights, spans = zip(*FAKE_GAMES)
+    sessions: list[tuple[str, int, int]] = []
+    for day in range(days):
+        day_start = end - (day + 1) * 86400
+        for _ in range(random.choice([0, 0, 1, 1, 2])):
+            i = random.choices(range(len(names)), weights=weights)[0]
+            start = day_start + random.choice([16, 18, 19, 20, 21, 22]) * 3600
+            lo, hi = spans[i]
+            sessions.append((names[i], start, start + random.randint(lo, hi) * 60))
+    return sessions
+
+
 def main() -> None:
     OUT.mkdir(exist_ok=True)
     tz = ZoneInfo("Europe/London")
@@ -49,6 +74,7 @@ def main() -> None:
             "quietone", msgs[:400], [], tz, "Europe/London", None),
         "stats.png": _build_stats_png(
             "moonlace", msgs, sessions, tz, "Europe/London", date(2024, 11, 3)),
+        "games.png": _build_games_png("moonlace", fake_games()),
     }
     for filename, buf in renders.items():
         (OUT / filename).write_bytes(buf.getvalue())

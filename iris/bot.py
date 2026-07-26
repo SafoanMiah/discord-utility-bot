@@ -52,6 +52,7 @@ class IrisClient(discord.Client):
         intents.guilds = True          # required
         intents.voice_states = True    # on_voice_state_update + VC snapshots
         intents.members = True         # privileged: joined_at + reliable snapshots
+        intents.presences = True       # privileged: on_presence_update + game names
         # Privileged, and used for exactly one thing: Discord hides other
         # bots' EMBEDS without it, and /backlog vc parses CircleBot's log
         # embeds. Iris never reads or stores anyone's message text.
@@ -111,6 +112,23 @@ class IrisClient(discord.Client):
         if after.channel is not None:
             await storage.open_voice_session(member.id, member.guild.id, after.channel.id, now)
 
+    async def on_presence_update(
+        self, before: discord.Member, after: discord.Member
+    ) -> None:
+        # Presence updates fire constantly (status flips, Spotify progress…);
+        # we only care when the SET of games being played changes.
+        if after.bot or after.id in self.opted_out:
+            return
+        before_games = _playing_games(before)
+        after_games = _playing_games(after)
+        if before_games == after_games:
+            return
+        now = int(time.time())
+        for game in before_games - after_games:
+            await storage.close_game_session(after.id, after.guild.id, game, now)
+        for game in after_games - before_games:
+            await storage.open_game_session(after.id, after.guild.id, game, now)
+
     # -- crash recovery -------------------------------------------------------
 
     async def on_ready(self) -> None:
@@ -120,9 +138,13 @@ class IrisClient(discord.Client):
         self._voice_recovered = True
         now = int(time.time())
         stale = await storage.reconcile_open_sessions(now)
-        if stale:
-            log.info("Reconciled %d session(s) left open by a previous run", stale)
-        opened = 0
+        stale_games = await storage.reconcile_open_game_sessions(now)
+        if stale or stale_games:
+            log.info(
+                "Reconciled %d voice and %d game session(s) left open by a previous run",
+                stale, stale_games,
+            )
+        opened = played = 0
         for guild in self.guilds:
             for channel in (*guild.voice_channels, *guild.stage_channels):
                 for member in channel.members:
@@ -130,8 +152,16 @@ class IrisClient(discord.Client):
                         continue
                     await storage.open_voice_session(member.id, guild.id, channel.id, now)
                     opened += 1
+            for member in guild.members:
+                if member.bot or member.id in self.opted_out:
+                    continue
+                for game in _playing_games(member):
+                    await storage.open_game_session(member.id, guild.id, game, now)
+                    played += 1
         if opened:
             log.info("Snapshotted %d member(s) already in voice", opened)
+        if played:
+            log.info("Snapshotted %d game(s) already being played", played)
         if not heartbeat_loop.is_running():
             heartbeat_loop.start()
         if config.BACKUP_CHANNEL_ID and not backup_loop.is_running():
@@ -146,13 +176,35 @@ class IrisClient(discord.Client):
             if not member.bot and member.id not in self.opted_out
         ]
 
+    def members_playing(self) -> list[tuple[int, str]]:
+        """(user_id, game) for every game currently being played, filtered."""
+        return [
+            (member.id, game)
+            for guild in self.guilds
+            for member in guild.members
+            if not member.bot and member.id not in self.opted_out
+            for game in _playing_games(member)
+        ]
+
+
+def _playing_games(member: discord.Member) -> set[str]:
+    """The named games a member is currently playing (Rich Presence). Excludes
+    custom statuses, Spotify, streaming — only ActivityType.playing."""
+    return {
+        activity.name
+        for activity in member.activities
+        if activity.type is discord.ActivityType.playing and activity.name
+    }
+
 
 client = IrisClient()
 
 
 @tasks.loop(seconds=config.HEARTBEAT_SECONDS)
 async def heartbeat_loop() -> None:
-    await storage.heartbeat(client.members_in_voice(), int(time.time()))
+    now = int(time.time())
+    await storage.heartbeat(client.members_in_voice(), now)
+    await storage.heartbeat_games(client.members_playing(), now)
 
 
 # -- database backups ----------------------------------------------------------
@@ -271,6 +323,14 @@ def _build_activity_png(name, msgs, sessions, tz, tz_label, day_index):
     return charts.render_activity_day(
         name, f"Activity · {WEEKDAYS[day_index]}s · times in {tz_label}",
         analysis.day_slice(msg_grid, day_index), analysis.day_slice(vc_grid, day_index),
+    )
+
+
+def _build_games_png(name, game_sessions):
+    """Sync: aggregation + render, run via asyncio.to_thread. game_sessions is
+    a list of (game, start_utc, end_utc); totals are timezone-independent."""
+    return charts.render_games(
+        name, "Top games · all time", analysis.game_totals(game_sessions)
     )
 
 
@@ -420,6 +480,26 @@ async def stats_card(interaction: discord.Interaction, user: discord.Member) -> 
     await _send_chart(interaction, png, "stats.png", note)
 
 
+@stats_group.command(name="games", description="Most-played games for a member")
+@app_commands.describe(user="Member to view")
+async def stats_games(interaction: discord.Interaction, user: discord.Member) -> None:
+    await interaction.response.defer()
+    if user.bot:
+        await interaction.followup.send("Bots aren't tracked.")
+        return
+    if await storage.is_opted_out(user.id):
+        await interaction.followup.send("No data — this user has opted out.")
+        return
+    game_sessions = await storage.get_game_sessions(user.id, interaction.guild_id)
+    if not game_sessions:
+        await interaction.followup.send(
+            f"No game activity recorded for **{user.display_name}** yet."
+        )
+        return
+    png = await asyncio.to_thread(_build_games_png, user.display_name, game_sessions)
+    await interaction.followup.send(file=discord.File(png, filename="games.png"))
+
+
 client.tree.add_command(stats_group)
 
 
@@ -435,8 +515,8 @@ async def privacy_optout(interaction: discord.Interaction) -> None:
     await storage.set_optout(interaction.user.id)
     client.opted_out.add(interaction.user.id)
     await interaction.response.send_message(
-        "Opted out. Your recorded messages and voice sessions have been deleted, "
-        "and Iris will no longer log you.",
+        "Opted out. Your recorded messages, voice sessions, and game activity "
+        "have been deleted, and Iris will no longer log you.",
         ephemeral=True,
     )
 
@@ -445,12 +525,17 @@ async def privacy_optout(interaction: discord.Interaction) -> None:
 async def privacy_optin(interaction: discord.Interaction) -> None:
     await storage.set_optin(interaction.user.id)
     client.opted_out.discard(interaction.user.id)
-    # If they're sitting in a voice channel right now, start tracking immediately.
+    # If they're in voice or playing something right now, start tracking those
+    # immediately rather than waiting for the next join/presence change.
     member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
-    if member and member.voice and member.voice.channel:
-        await storage.open_voice_session(
-            member.id, interaction.guild_id, member.voice.channel.id, int(time.time())
-        )
+    if member:
+        now = int(time.time())
+        if member.voice and member.voice.channel:
+            await storage.open_voice_session(
+                member.id, interaction.guild_id, member.voice.channel.id, now
+            )
+        for game in _playing_games(member):
+            await storage.open_game_session(member.id, interaction.guild_id, game, now)
     await interaction.response.send_message(
         "Opted in — Iris will log your activity from now on. "
         "Previously deleted history is not restored.",
@@ -747,15 +832,19 @@ async def main() -> None:
             await client.start(config.DISCORD_TOKEN)
         except discord.PrivilegedIntentsRequired:
             raise SystemExit(
-                "Discord refused the connection: enable BOTH 'Server Members "
-                "Intent' and 'Message Content Intent' in the Developer Portal "
-                "(your app -> Bot -> Privileged Gateway Intents), then restart."
+                "Discord refused the connection: enable ALL THREE of 'Server "
+                "Members Intent', 'Presence Intent', and 'Message Content "
+                "Intent' in the Developer Portal (your app -> Bot -> Privileged "
+                "Gateway Intents), then restart."
             )
         finally:
-            # Graceful shutdown: everyone in VC "leaves" now, so no session is
-            # left open and reconcile has nothing to guess at next boot.
+            # Graceful shutdown: everyone in VC "leaves" and every open game
+            # "stops" now, so nothing is left open and reconcile has nothing to
+            # guess at next boot.
             heartbeat_loop.cancel()
-            await storage.close_all_open_sessions(int(time.time()))
+            now = int(time.time())
+            await storage.close_all_open_sessions(now)
+            await storage.close_all_open_game_sessions(now)
             await storage.close()
 
 
