@@ -1,13 +1,13 @@
 # Iris
 
-A Discord bot for our server. It keeps track of when people chat, hang out in
-voice, and what games they play, then turns that into nice looking charts. It
-never stores what anyone writes, only the times (and, for games, the name
-Discord shows — e.g. "VALORANT"). No XP, no levels, just stats.
+A Discord bot for our server. It tracks when people chat, sit in voice, and
+what games they play, then draws charts from that. It never stores what anyone
+writes - only the times, plus game names like "VALORANT". No XP, no levels,
+just stats.
 
 ## Running it
 
-You need Python 3.11 or newer.
+You'll need Python 3.11 or newer.
 
 ```
 python -m venv .venv
@@ -20,70 +20,86 @@ Put your settings in a `.env` file in the repo root:
 ```
 DISCORD_TOKEN=your-bot-token
 GUILD_ID=your-server-id
-BACKUP_CHANNEL_ID=a-private-channel-id
 ```
 
-`GUILD_ID` is optional but makes slash commands show up instantly instead of
-taking up to an hour. `BACKUP_CHANNEL_ID` is optional too: when set, Iris
-posts a compressed copy of its database to that channel every day (and on
-`/backup`), so even if the host dies you can restore from the latest file.
-Make it a private channel, and get the id by right-clicking the channel with
-Discord developer mode turned on.
+`GUILD_ID` is optional, but it makes slash commands show up instantly instead
+of taking up to an hour.
 
-In the Discord Developer Portal (your app, then Bot, then Privileged Gateway
-Intents) turn on **Server Members**, **Presence**, and **Message Content**.
-Presence is what lets Iris see when someone starts and stops playing a game.
-Message Content sounds scary but it's only there because Discord hides other
-bots' embeds without it, and `/backlog vc` needs to read CircleBot's log
-embeds. Iris does not read or store anyone's actual messages.
+Once Iris is running, set an **admin channel** with `/admin set #channel`.
+Iris drops a compressed copy of its database there every day (and on
+`/backup`), so if the host dies you can restore from the latest file. Other
+admin messages go there too, so use a private channel. Nothing is posted until
+you set it.
+
+In the Discord Developer Portal (your app → Bot → Privileged Gateway Intents),
+turn on **Server Members**, **Presence**, and **Message Content**. Presence is
+how Iris sees game activity. Message Content sounds scary, but it's only needed
+because Discord hides other bots' embeds without it - Iris never reads or
+stores anyone's messages.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `/stats activity @user` | Charts of when someone chats and sits in voice. Add a day to see just Fridays etc. |
-| `/stats card @user` | A stat card: totals, most active hour, longest voice session and so on |
-| `/stats games @user` | Their most-played games, ranked by time played |
-| `/timezone set` | Set your timezone, all charts then show in your local time |
+| `/stats activity @user` | Charts of when someone chats and sits in voice. Add a day to see just Fridays, etc. |
+| `/stats card @user` | A stat card: totals, most active hour, longest voice session, and so on |
+| `/stats games @user` | Their most-played games, ranked by time |
+| `/timezone set` | Set your timezone so charts show your local time |
 | `/timezone show` / `clear` | Check or remove it |
-| `/privacy optout` | Stop being tracked and delete everything Iris has on you |
-| `/privacy optin` | Start being tracked again (deleted data stays deleted) |
-| `/backlog chats` | Reads all channel history and fills in past message activity (managers only) |
-| `/backlog vc #channel` | Rebuilds past voice sessions from CircleBot's logs in that channel (managers only) |
-| `/backup` | Posts a database backup to the backup channel right now (managers only) |
+| `/privacy optout` | Stop tracking and delete everything Iris has on you |
+| `/privacy optin` | Start tracking again (deleted data stays deleted) |
+| `/vote` | Start a button poll. Opens a form for the title and options; pick public/anonymous and single/multiple choice |
+| `/backlog chats` | Fill in past message activity from channel history (managers only) |
+| `/admin set #channel` | Set the channel for backups and alerts (managers only) |
+| `/admin show` | Show the current admin channel (managers only) |
+| `/backup` | Post a database backup right now (managers only) |
 
-Charts always use the timezone of whoever ran the command. If you haven't set
-one, they're in UTC and the bot privately tells you how to set it.
+Charts use the timezone of whoever ran the command. Without one, they're in
+UTC and Iris quietly tells you how to set yours.
 
-Bots are never tracked. Neither are people who opted out, including in
-backfills.
+Bots and opted-out people are never tracked, backfills included.
+
+### Votes
+
+`/vote` posts a poll with a button per option; the embed tallies live as people
+click. Options go one per line in the form. Add ` | ` after an option and Iris
+will DM that text to whoever picks it (handy for links or instructions) —
+falling back to a private reply if their DMs are closed:
+
+```
+Attend | See you Friday 7pm — here's the link: https://…
+Maybe
+Can't make it
+```
+
+Public votes list who chose each option; anonymous ones show only counts. When
+the creator or a manager closes a vote, the final results are copied to the
+admin channel (anonymous votes stay anonymous there too).
 
 ## Good to know
 
-- Everything is stored as UTC timestamps in one SQLite file (`iris.db`).
-  Back that file up now and then, it's the whole database.
-- If the bot crashes, voice time still gets saved. It checkpoints every
-  minute, so worst case you lose 60 seconds.
-- Both `/backlog` commands are safe to run again, they skip anything already
-  recorded instead of counting it twice.
-- Game activity can't be backfilled — Discord keeps no history of it, so it
-  only starts counting once Iris is running with the Presence intent on. Like
-  voice, open game sessions checkpoint every minute and survive crashes.
-- Only run one copy of the bot at a time.
+- Everything lives in one SQLite file (`iris.db`) as UTC timestamps. Back it
+  up now and then - that's the whole database.
+- Voice time survives crashes. It checkpoints every minute, so worst case you
+  lose 60 seconds. Game sessions work the same way.
+- `/backlog chats` is safe to re-run - it skips anything already recorded.
+- Game activity can't be backfilled. Discord keeps no history of it, so
+  counting only starts once Iris is running with the Presence intent on.
+- Run only one copy of the bot at a time.
 
 ## Hosting
 
-Any always-on box with about 1 GB of RAM works. Options, best first:
+Any always-on box with ~1 GB of RAM works. Best options first:
 
-- A VM you control (Oracle Cloud Always Free, Google Cloud e2-micro, a
-  Raspberry Pi at home). Most reliable.
-- A free bot hosting panel (bot-hosting.net, Wispbyte and similar). Fine for
-  a friends server, but set `BACKUP_CHANNEL_ID` first: free panels can wipe
-  files or disappear, and the daily Discord backup is what makes that
-  survivable. `main.py` at the repo root exists so panels have a file to run.
+- **A VM you control** - Oracle Cloud Always Free, Google Cloud e2-micro, or a
+  Raspberry Pi at home. Most reliable.
+- **A free bot-hosting panel** - bot-hosting.net, Wispbyte, and the like. Fine
+  for a friends server, but set an admin channel first: free panels can wipe
+  files or vanish, and the daily backup is what saves you. `main.py` at the
+  repo root is there so panels have a file to run.
 
-To restore from a backup: download the newest `iris-*.db.gz` from the backup
-channel, un-gzip it, name it `iris.db`, put it next to the bot, start it.
+To restore a backup: grab the newest `iris-*.db.gz` from the admin channel,
+un-gzip it, rename it `iris.db`, drop it next to the bot, and start it.
 
 On a Linux VM, run it under systemd so it restarts itself:
 
@@ -105,10 +121,10 @@ WantedBy=multi-user.target
 
 ## For development
 
-- `python preview.py` renders sample charts with fake data into `preview_out/`
+- `python preview.py` renders sample charts with fake data into `preview_out/`,
   so you can tweak the look without touching Discord.
 - `python -m pytest tests/` runs the tests.
-- Layout: `bot.py` is Discord stuff, `storage.py` is the only file that talks
-  to the database, `analysis.py` does the number crunching, `charts.py` and
-  `theme.py` draw the images. If you ever move to Postgres you only rewrite
-  `storage.py`.
+- Layout: `bot.py` is the Discord side, `storage.py` is the only file that
+  touches the database, `analysis.py` does the number crunching, and
+  `charts.py` / `theme.py` draw the images. Moving to Postgres would only mean
+  rewriting `storage.py`.

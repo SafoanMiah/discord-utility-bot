@@ -39,6 +39,44 @@ CREATE TABLE IF NOT EXISTS game_sessions (
   last_heartbeat_utc INTEGER           -- updated while open; used for crash recovery
 );
 
+-- Bot-wide settings as key/value pairs, e.g. 'admin_channel_id'. Not
+-- guild-scoped: the backup this feeds contains every guild's data.
+CREATE TABLE IF NOT EXISTS settings (
+  key   TEXT PRIMARY KEY,
+  value TEXT
+);
+
+-- /vote polls. Buttons on the posted message drive everything; the message id
+-- links a live message back to its row so the persistent view can be rebuilt
+-- after a restart. Nothing here is user message content.
+CREATE TABLE IF NOT EXISTS votes (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  guild_id     INTEGER NOT NULL,
+  channel_id   INTEGER NOT NULL,
+  message_id   INTEGER,                       -- set once the message is posted
+  creator_id   INTEGER NOT NULL,
+  title        TEXT NOT NULL,
+  anonymous    INTEGER NOT NULL DEFAULT 0,    -- 1 = hide who voted, show counts only
+  multiple     INTEGER NOT NULL DEFAULT 0,    -- 1 = pick many, 0 = single choice
+  closed       INTEGER NOT NULL DEFAULT 0,
+  created_utc  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS vote_options (
+  vote_id  INTEGER NOT NULL,
+  idx      INTEGER NOT NULL,                  -- 0-based position / button order
+  label    TEXT NOT NULL,
+  dm       TEXT,                              -- optional message DM'd on selection
+  PRIMARY KEY (vote_id, idx)
+);
+
+CREATE TABLE IF NOT EXISTS vote_ballots (
+  vote_id  INTEGER NOT NULL,
+  user_id  INTEGER NOT NULL,
+  idx      INTEGER NOT NULL,
+  PRIMARY KEY (vote_id, user_id, idx)         -- single-choice enforced in code
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id, guild_id, ts_utc);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_mid ON messages(message_id)
   WHERE message_id IS NOT NULL;
@@ -46,3 +84,5 @@ CREATE INDEX IF NOT EXISTS idx_voice_user    ON voice_sessions(user_id, guild_id
 CREATE INDEX IF NOT EXISTS idx_voice_open    ON voice_sessions(end_utc);
 CREATE INDEX IF NOT EXISTS idx_game_user     ON game_sessions(user_id, guild_id, start_utc);
 CREATE INDEX IF NOT EXISTS idx_game_open     ON game_sessions(end_utc);
+CREATE INDEX IF NOT EXISTS idx_vote_ballots  ON vote_ballots(vote_id);
+CREATE INDEX IF NOT EXISTS idx_votes_open    ON votes(closed);

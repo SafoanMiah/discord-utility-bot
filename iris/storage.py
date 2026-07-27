@@ -57,6 +57,141 @@ class Storage:
         read transaction and produces a single self-contained file)."""
         await self.db.execute("VACUUM INTO ?", (path,))
 
+    # -- settings -----------------------------------------------------------
+
+    async def get_setting(self, key: str) -> str | None:
+        async with self.db.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,)
+        ) as cur:
+            row = await cur.fetchone()
+        return row[0] if row else None
+
+    async def set_setting(self, key: str, value: str) -> None:
+        await self.db.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+        await self.db.commit()
+
+    async def get_admin_channel_id(self) -> int | None:
+        value = await self.get_setting("admin_channel_id")
+        return int(value) if value else None
+
+    async def set_admin_channel_id(self, channel_id: int) -> None:
+        await self.set_setting("admin_channel_id", str(channel_id))
+
+    # -- votes --------------------------------------------------------------
+
+    async def create_vote(
+        self,
+        guild_id: int,
+        channel_id: int,
+        creator_id: int,
+        title: str,
+        anonymous: bool,
+        multiple: bool,
+        options: list[tuple[str, str | None]],
+        created_utc: int,
+    ) -> int:
+        """Insert a vote and its options (label, dm). Returns the new vote id."""
+        cur = await self.db.execute(
+            "INSERT INTO votes"
+            " (guild_id, channel_id, creator_id, title, anonymous, multiple, created_utc)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (guild_id, channel_id, creator_id, title, int(anonymous), int(multiple), created_utc),
+        )
+        vote_id = cur.lastrowid
+        await self.db.executemany(
+            "INSERT INTO vote_options (vote_id, idx, label, dm) VALUES (?, ?, ?, ?)",
+            [(vote_id, i, label, dm) for i, (label, dm) in enumerate(options)],
+        )
+        await self.db.commit()
+        return vote_id
+
+    async def set_vote_message(self, vote_id: int, message_id: int) -> None:
+        await self.db.execute(
+            "UPDATE votes SET message_id = ? WHERE id = ?", (message_id, vote_id)
+        )
+        await self.db.commit()
+
+    async def get_vote(self, vote_id: int) -> dict | None:
+        """The vote row as a dict, or None if it doesn't exist."""
+        async with self.db.execute(
+            "SELECT id, guild_id, channel_id, message_id, creator_id, title,"
+            " anonymous, multiple, closed, created_utc FROM votes WHERE id = ?",
+            (vote_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        keys = ("id", "guild_id", "channel_id", "message_id", "creator_id", "title",
+                "anonymous", "multiple", "closed", "created_utc")
+        return dict(zip(keys, row))
+
+    async def get_vote_options(self, vote_id: int) -> list[tuple[int, str, str | None]]:
+        """Rows of (idx, label, dm) in button order."""
+        async with self.db.execute(
+            "SELECT idx, label, dm FROM vote_options WHERE vote_id = ? ORDER BY idx",
+            (vote_id,),
+        ) as cur:
+            return await cur.fetchall()
+
+    async def get_ballots(self, vote_id: int) -> dict[int, list[int]]:
+        """{option idx -> [user_id, …]} in the order votes were cast."""
+        async with self.db.execute(
+            "SELECT idx, user_id FROM vote_ballots WHERE vote_id = ? ORDER BY rowid",
+            (vote_id,),
+        ) as cur:
+            tally: dict[int, list[int]] = {}
+            for idx, user_id in await cur.fetchall():
+                tally.setdefault(idx, []).append(user_id)
+        return tally
+
+    async def cast_ballot(
+        self, vote_id: int, user_id: int, idx: int, multiple: bool
+    ) -> str:
+        """Toggle a user's selection of one option. Returns 'removed' (they had
+        it and now don't), 'added' (fresh selection), or 'moved' (single-choice:
+        replaced a different option)."""
+        async with self.db.execute(
+            "SELECT idx FROM vote_ballots WHERE vote_id = ? AND user_id = ?",
+            (vote_id, user_id),
+        ) as cur:
+            existing = [r[0] for r in await cur.fetchall()]
+        if idx in existing:
+            await self.db.execute(
+                "DELETE FROM vote_ballots WHERE vote_id = ? AND user_id = ? AND idx = ?",
+                (vote_id, user_id, idx),
+            )
+            await self.db.commit()
+            return "removed"
+        moved = False
+        if not multiple and existing:
+            await self.db.execute(
+                "DELETE FROM vote_ballots WHERE vote_id = ? AND user_id = ?",
+                (vote_id, user_id),
+            )
+            moved = True
+        await self.db.execute(
+            "INSERT INTO vote_ballots (vote_id, user_id, idx) VALUES (?, ?, ?)",
+            (vote_id, user_id, idx),
+        )
+        await self.db.commit()
+        return "moved" if moved else "added"
+
+    async def close_vote(self, vote_id: int) -> None:
+        await self.db.execute("UPDATE votes SET closed = 1 WHERE id = ?", (vote_id,))
+        await self.db.commit()
+
+    async def get_open_votes(self) -> list[tuple[int, int]]:
+        """(vote_id, message_id) for open votes that have been posted — used to
+        re-attach their button views after a restart."""
+        async with self.db.execute(
+            "SELECT id, message_id FROM votes WHERE closed = 0 AND message_id IS NOT NULL"
+        ) as cur:
+            return await cur.fetchall()
+
     # -- timezones ----------------------------------------------------------
 
     async def set_timezone(self, user_id: int, tz: str) -> None:

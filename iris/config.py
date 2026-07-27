@@ -25,10 +25,8 @@ _load_dotenv(REPO_ROOT / ".env")
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN") or os.environ.get("DISCORD_BOT_TOKEN", "")
 DB_PATH = os.environ.get("DB_PATH", str(REPO_ROOT / "iris.db"))
 GUILD_ID = int(os.environ["GUILD_ID"]) if os.environ.get("GUILD_ID") else None
-# A private channel id; when set, the database is posted there daily and via /backup.
-BACKUP_CHANNEL_ID = (
-    int(os.environ["BACKUP_CHANNEL_ID"]) if os.environ.get("BACKUP_CHANNEL_ID") else None
-)
+# The channel for administrative messages (daily DB backups, alerts) is no
+# longer an env var — it's set at runtime with /admin set and lives in the db.
 
 HEARTBEAT_SECONDS = 60
 

@@ -65,6 +65,11 @@ class IrisClient(discord.Client):
     async def setup_hook(self) -> None:
         await storage.open()
         self.opted_out = await storage.get_opted_out_ids()
+        # Re-attach button views to still-open votes so they keep working
+        # across restarts (persistent views, keyed by their message id).
+        for vote_id, message_id in await storage.get_open_votes():
+            options = await storage.get_vote_options(vote_id)
+            self.add_view(VoteView(vote_id, options), message_id=message_id)
         if config.GUILD_ID:
             guild = discord.Object(id=config.GUILD_ID)
             self.tree.copy_global_to(guild=guild)
@@ -164,7 +169,8 @@ class IrisClient(discord.Client):
             log.info("Snapshotted %d game(s) already being played", played)
         if not heartbeat_loop.is_running():
             heartbeat_loop.start()
-        if config.BACKUP_CHANNEL_ID and not backup_loop.is_running():
+        # Always run; the loop no-ops on any day no admin channel is set.
+        if not backup_loop.is_running():
             backup_loop.start()
 
     def members_in_voice(self) -> list[int]:
@@ -207,9 +213,22 @@ async def heartbeat_loop() -> None:
     await storage.heartbeat_games(client.members_playing(), now)
 
 
-# -- database backups ----------------------------------------------------------
+# -- admin channel & database backups ------------------------------------------
 # Free hosts can vanish or wipe files; posting the db to a private Discord
-# channel means the data survives anything short of Discord itself.
+# channel means the data survives anything short of Discord itself. That
+# channel — the admin channel, set with /admin set — is also where any other
+# administrative messages go.
+
+
+async def _admin_channel() -> discord.abc.Messageable | None:
+    """The configured admin channel, or None if unset or invisible to Iris."""
+    channel_id = await storage.get_admin_channel_id()
+    if channel_id is None:
+        return None
+    channel = client.get_channel(channel_id)
+    if channel is None:
+        log.warning("Admin channel %s is not a channel I can see", channel_id)
+    return channel
 
 def _gzip_file(src: Path, dest: Path) -> None:
     with open(src, "rb") as fin, gzip.open(dest, "wb") as fout:
@@ -228,9 +247,8 @@ async def _make_backup_file() -> Path:
 
 
 async def _post_backup(reason: str) -> discord.Message | None:
-    channel = client.get_channel(config.BACKUP_CHANNEL_ID)
+    channel = await _admin_channel()
     if channel is None:
-        log.warning("BACKUP_CHANNEL_ID %s is not a channel I can see", config.BACKUP_CHANNEL_ID)
         return None
     packed = await _make_backup_file()
     try:
@@ -251,15 +269,14 @@ async def backup_loop() -> None:
         log.exception("Daily backup failed")
 
 
-@client.tree.command(name="backup", description="Post a database backup to the backup channel now")
+@client.tree.command(name="backup", description="Post a database backup to the admin channel now")
 @app_commands.default_permissions(manage_guild=True)
 @app_commands.guild_only()
 async def backup_cmd(interaction: discord.Interaction) -> None:
-    if not config.BACKUP_CHANNEL_ID:
+    if await storage.get_admin_channel_id() is None:
         await interaction.response.send_message(
-            "No backup channel configured. Add `BACKUP_CHANNEL_ID=<channel id>` to the "
-            ".env file (right-click a private channel with developer mode on to copy "
-            "its id) and restart.",
+            "No admin channel set. An admin can set one with `/admin set` — database "
+            "backups and other administrative messages go there.",
             ephemeral=True,
         )
         return
@@ -267,11 +284,57 @@ async def backup_cmd(interaction: discord.Interaction) -> None:
     message = await _post_backup("manual")
     if message is None:
         await interaction.followup.send(
-            "I can't see the configured backup channel — check `BACKUP_CHANNEL_ID` "
-            "and my permissions there.", ephemeral=True,
+            "I can't see the admin channel — check my permissions there, or point me "
+            "at a new one with `/admin set`.", ephemeral=True,
         )
     else:
         await interaction.followup.send(f"Backup posted: {message.jump_url}", ephemeral=True)
+
+
+# -- /admin -------------------------------------------------------------------
+
+admin_group = app_commands.Group(
+    name="admin",
+    description="Bot administration (server managers only)",
+    guild_only=True,
+    default_permissions=discord.Permissions(manage_guild=True),
+)
+
+
+@admin_group.command(
+    name="set",
+    description="Set the channel for administrative messages (daily DB backups, alerts)",
+)
+@app_commands.describe(channel="Channel Iris posts administrative messages to")
+async def admin_set(interaction: discord.Interaction, channel: discord.TextChannel) -> None:
+    perms = channel.permissions_for(interaction.guild.me)
+    if not (perms.view_channel and perms.send_messages):
+        await interaction.response.send_message(
+            f"I can't post in {channel.mention} — grant me **View Channel** and "
+            "**Send Messages** there first.", ephemeral=True,
+        )
+        return
+    await storage.set_admin_channel_id(channel.id)
+    await interaction.response.send_message(
+        f"Admin channel set to {channel.mention}. Daily database backups and other "
+        "administrative messages will go there.", ephemeral=True,
+    )
+
+
+@admin_group.command(name="show", description="Show the current admin channel")
+async def admin_show(interaction: discord.Interaction) -> None:
+    channel_id = await storage.get_admin_channel_id()
+    if channel_id is None:
+        await interaction.response.send_message(
+            "No admin channel set — use `/admin set`.", ephemeral=True
+        )
+        return
+    channel = client.get_channel(channel_id)
+    where = channel.mention if channel else f"a channel I can't currently see (id `{channel_id}`)"
+    await interaction.response.send_message(f"Admin channel is {where}.", ephemeral=True)
+
+
+client.tree.add_command(admin_group)
 
 
 # -- shared helpers -----------------------------------------------------------
@@ -654,140 +717,443 @@ async def _run_chat_backfill(interaction: discord.Interaction) -> None:
     await progress("\n".join(lines), force=True)
 
 
-_USER_ID_RE = re.compile(r"User ID:\s*(\d{15,21})")
-_MENTION_RE = re.compile(r"<@!?(\d{15,21})>")
-_CHANNEL_MENTION_RE = re.compile(r"<#(\d{15,21})>")
-
-
-def _parse_circle_embed(
-    embed: discord.Embed, message: discord.Message, vc_name_to_id: dict[str, int]
-) -> tuple[int, int, int, str] | None:
-    """One CircleBot log embed -> (ts_utc, user_id, channel_id, kind), or None
-    for entries that aren't voice joins/leaves (nick changes, server joins…)."""
-    text = " ".join(filter(None, (embed.title, embed.description)))
-    if "has joined a voice channel" in text:
-        kind = "join"
-    elif "has left a voice channel" in text:
-        kind = "leave"
-    else:
-        return None
-
-    match = _USER_ID_RE.search(embed.footer.text or "") or _MENTION_RE.search(text)
-    if not match:
-        return None
-    user_id = int(match.group(1))
-
-    channel_id = 0  # unknown/renamed channels still count toward totals
-    for field in embed.fields:
-        if (field.name or "").strip().lower() == "channel":
-            value = (field.value or "").strip()
-            chan_match = _CHANNEL_MENTION_RE.search(value)
-            channel_id = int(chan_match.group(1)) if chan_match else vc_name_to_id.get(value, 0)
-            break
-
-    when = embed.timestamp or message.created_at
-    return (int(when.timestamp()), user_id, channel_id, kind)
-
-
-@backlog_group.command(
-    name="vc",
-    description="Rebuild past voice sessions from CircleBot's log history",
-)
-@app_commands.describe(channel="The channel where CircleBot posts its logs")
-async def backlog_vc(interaction: discord.Interaction, channel: discord.TextChannel) -> None:
-    guild = interaction.guild
-    if guild.id in _backfills_running:
-        await interaction.response.send_message(
-            "A backfill is already running for this server.", ephemeral=True
-        )
-        return
-    perms = channel.permissions_for(guild.me)
-    if not (perms.view_channel and perms.read_message_history):
-        await interaction.response.send_message(
-            f"I can't read the history of {channel.mention} — grant me "
-            "**View Channel** and **Read Message History** there first.",
-            ephemeral=True,
-        )
-        return
-    await interaction.response.defer()
-    _backfills_running.add(guild.id)
-    try:
-        await _run_vc_backfill(interaction, channel)
-    finally:
-        _backfills_running.discard(guild.id)
-
-
-async def _run_vc_backfill(
-    interaction: discord.Interaction, channel: discord.TextChannel
-) -> None:
-    guild = interaction.guild
-    progress = _progress_editor(interaction)
-    vc_name_to_id = {
-        ch.name: ch.id for ch in (*guild.voice_channels, *guild.stage_channels)
-    }
-
-    events: list[tuple[int, int, int, str]] = []
-    scanned = embeds_seen = 0
-    async for msg in channel.history(limit=None, oldest_first=True):
-        if msg.author.id != config.CIRCLEBOT_ID:
-            continue
-        scanned += 1
-        for embed in msg.embeds:
-            embeds_seen += 1
-            event = _parse_circle_embed(embed, msg, vc_name_to_id)
-            if event is not None:
-                events.append(event)
-        if scanned % 500 == 0:
-            await progress(
-                f"Reading CircleBot logs in {channel.mention}… {scanned:,} messages "
-                f"scanned, {len(events):,} voice events found."
-            )
-
-    if scanned == 0:
-        await progress(
-            f"No CircleBot messages found in {channel.mention} — is that the right "
-            "log channel?", force=True,
-        )
-        return
-    if embeds_seen == 0:
-        await progress(
-            f"Found {scanned:,} CircleBot messages but Discord returned no embed "
-            "data. Enable **Message Content Intent** in the Developer Portal "
-            "(Bot → Privileged Gateway Intents) and restart Iris.", force=True,
-        )
-        return
-
-    # NEVER log bots; respect opt-outs even for historical data.
-    def tracked(user_id: int) -> bool:
-        if user_id in client.opted_out:
-            return False
-        member = guild.get_member(user_id)
-        return member is None or not member.bot
-
-    events = [e for e in events if tracked(e[1])]
-
-    cutoff = await storage.earliest_live_voice_start(guild.id)
-    sessions, ignored = analysis.reconstruct_sessions(events, cutoff)
-    replaced = await storage.delete_voice_sessions_by_source(guild.id, "backlog")
-    added = await storage.add_voice_sessions_bulk(guild.id, sessions)
-
-    users = len({s[0] for s in sessions})
-    lines = [
-        f"Voice backlog complete: rebuilt **{added:,}** sessions for {users} members "
-        f"from {len(events):,} join/leave events."
-    ]
-    if replaced:
-        lines.append(f"Replaced {replaced:,} sessions from a previous import.")
-    if cutoff:
-        lines.append("Events after Iris's own voice tracking began were skipped "
-                     "so nothing is counted twice.")
-    if ignored:
-        lines.append(f"{ignored:,} events couldn't be paired (log gaps) and were ignored.")
-    lines.append("Bots and opted-out members were excluded.")
-    await progress("\n".join(lines), force=True)
+# /backlog vc is disabled — the CircleBot import was a one-time rebuild that's
+# already done. The command below is commented out so it no longer registers;
+# the storage/analysis helpers it used (reconstruct_sessions,
+# delete_voice_sessions_by_source, …) stay in place and remain tested. Uncomment
+# this whole block to bring the command back.
+#
+# _USER_ID_RE = re.compile(r"User ID:\s*(\d{15,21})")
+# _MENTION_RE = re.compile(r"<@!?(\d{15,21})>")
+# _CHANNEL_MENTION_RE = re.compile(r"<#(\d{15,21})>")
+#
+#
+# def _parse_circle_embed(
+#     embed: discord.Embed, message: discord.Message, vc_name_to_id: dict[str, int]
+# ) -> tuple[int, int, int, str] | None:
+#     """One CircleBot log embed -> (ts_utc, user_id, channel_id, kind), or None
+#     for entries that aren't voice joins/leaves (nick changes, server joins…)."""
+#     text = " ".join(filter(None, (embed.title, embed.description)))
+#     if "has joined a voice channel" in text:
+#         kind = "join"
+#     elif "has left a voice channel" in text:
+#         kind = "leave"
+#     else:
+#         return None
+#
+#     match = _USER_ID_RE.search(embed.footer.text or "") or _MENTION_RE.search(text)
+#     if not match:
+#         return None
+#     user_id = int(match.group(1))
+#
+#     channel_id = 0  # unknown/renamed channels still count toward totals
+#     for field in embed.fields:
+#         if (field.name or "").strip().lower() == "channel":
+#             value = (field.value or "").strip()
+#             chan_match = _CHANNEL_MENTION_RE.search(value)
+#             channel_id = int(chan_match.group(1)) if chan_match else vc_name_to_id.get(value, 0)
+#             break
+#
+#     when = embed.timestamp or message.created_at
+#     return (int(when.timestamp()), user_id, channel_id, kind)
+#
+#
+# @backlog_group.command(
+#     name="vc",
+#     description="Rebuild past voice sessions from CircleBot's log history",
+# )
+# @app_commands.describe(channel="The channel where CircleBot posts its logs")
+# async def backlog_vc(interaction: discord.Interaction, channel: discord.TextChannel) -> None:
+#     guild = interaction.guild
+#     if guild.id in _backfills_running:
+#         await interaction.response.send_message(
+#             "A backfill is already running for this server.", ephemeral=True
+#         )
+#         return
+#     perms = channel.permissions_for(guild.me)
+#     if not (perms.view_channel and perms.read_message_history):
+#         await interaction.response.send_message(
+#             f"I can't read the history of {channel.mention} — grant me "
+#             "**View Channel** and **Read Message History** there first.",
+#             ephemeral=True,
+#         )
+#         return
+#     await interaction.response.defer()
+#     _backfills_running.add(guild.id)
+#     try:
+#         await _run_vc_backfill(interaction, channel)
+#     finally:
+#         _backfills_running.discard(guild.id)
+#
+#
+# async def _run_vc_backfill(
+#     interaction: discord.Interaction, channel: discord.TextChannel
+# ) -> None:
+#     guild = interaction.guild
+#     progress = _progress_editor(interaction)
+#     vc_name_to_id = {
+#         ch.name: ch.id for ch in (*guild.voice_channels, *guild.stage_channels)
+#     }
+#
+#     events: list[tuple[int, int, int, str]] = []
+#     scanned = embeds_seen = 0
+#     async for msg in channel.history(limit=None, oldest_first=True):
+#         if msg.author.id != config.CIRCLEBOT_ID:
+#             continue
+#         scanned += 1
+#         for embed in msg.embeds:
+#             embeds_seen += 1
+#             event = _parse_circle_embed(embed, msg, vc_name_to_id)
+#             if event is not None:
+#                 events.append(event)
+#         if scanned % 500 == 0:
+#             await progress(
+#                 f"Reading CircleBot logs in {channel.mention}… {scanned:,} messages "
+#                 f"scanned, {len(events):,} voice events found."
+#             )
+#
+#     if scanned == 0:
+#         await progress(
+#             f"No CircleBot messages found in {channel.mention} — is that the right "
+#             "log channel?", force=True,
+#         )
+#         return
+#     if embeds_seen == 0:
+#         await progress(
+#             f"Found {scanned:,} CircleBot messages but Discord returned no embed "
+#             "data. Enable **Message Content Intent** in the Developer Portal "
+#             "(Bot → Privileged Gateway Intents) and restart Iris.", force=True,
+#         )
+#         return
+#
+#     # NEVER log bots; respect opt-outs even for historical data.
+#     def tracked(user_id: int) -> bool:
+#         if user_id in client.opted_out:
+#             return False
+#         member = guild.get_member(user_id)
+#         return member is None or not member.bot
+#
+#     events = [e for e in events if tracked(e[1])]
+#
+#     cutoff = await storage.earliest_live_voice_start(guild.id)
+#     sessions, ignored = analysis.reconstruct_sessions(events, cutoff)
+#     replaced = await storage.delete_voice_sessions_by_source(guild.id, "backlog")
+#     added = await storage.add_voice_sessions_bulk(guild.id, sessions)
+#
+#     users = len({s[0] for s in sessions})
+#     lines = [
+#         f"Voice backlog complete: rebuilt **{added:,}** sessions for {users} members "
+#         f"from {len(events):,} join/leave events."
+#     ]
+#     if replaced:
+#         lines.append(f"Replaced {replaced:,} sessions from a previous import.")
+#     if cutoff:
+#         lines.append("Events after Iris's own voice tracking began were skipped "
+#                      "so nothing is counted twice.")
+#     if ignored:
+#         lines.append(f"{ignored:,} events couldn't be paired (log gaps) and were ignored.")
+#     lines.append("Bots and opted-out members were excluded.")
+#     await progress("\n".join(lines), force=True)
 
 
 client.tree.add_command(backlog_group)
+
+
+# -- /vote --------------------------------------------------------------------
+# A button poll. The command opens a modal for the title + options; each option
+# becomes a button. Results live in the message embed and update on every click.
+# An option line may carry a private DM after a " | " — whoever picks it gets
+# that message. Everything persists in the db, so votes survive restarts, and
+# closing a vote archives the results to the admin channel.
+
+MAX_VOTE_OPTIONS = 20         # 20 option buttons + a close button ≤ 25 per view
+_DM_DELIM = " | "
+_LABEL_STORE_MAX = 200        # generous for the embed; button labels cap at 80
+_BUTTON_LABEL_MAX = 80        # Discord's hard limit
+_NUM_EMOJI = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+
+
+def _num(idx: int) -> str:
+    return _NUM_EMOJI[idx] if idx < len(_NUM_EMOJI) else f"{idx + 1}."
+
+
+def _parse_vote_options(raw: str) -> tuple[list[tuple[str, str | None]], str | None]:
+    """Turn the modal's options box into (label, dm) pairs. Returns
+    (options, error); error is a user-facing message when the input is invalid.
+    Blank lines are ignored and duplicate labels dropped."""
+    options: list[tuple[str, str | None]] = []
+    seen: set[str] = set()
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        label, sep, dm = line.partition(_DM_DELIM)
+        label = label.strip()
+        dm = dm.strip()
+        if not label or label.casefold() in seen:
+            continue
+        seen.add(label.casefold())
+        options.append((label[:_LABEL_STORE_MAX], dm or None))
+    if len(options) < 2:
+        return [], "A vote needs at least 2 options — put one per line."
+    if len(options) > MAX_VOTE_OPTIONS:
+        return [], f"That's too many options — {MAX_VOTE_OPTIONS} is the max."
+    return options, None
+
+
+def _bar(count: int, top: int, width: int = 10) -> str:
+    filled = round(width * count / top) if top else 0
+    return "▰" * filled + "▱" * (width - filled)
+
+
+def _join_mentions(user_ids: list[int], budget: int = 900) -> str:
+    """Space-joined <@id> mentions, truncated to stay well under the 1024-char
+    embed field limit with a '+N more' tail."""
+    parts: list[str] = []
+    used = 0
+    for i, uid in enumerate(user_ids):
+        mention = f"<@{uid}>"
+        if used + len(mention) + 1 > budget:
+            parts.append(f"… +{len(user_ids) - i} more")
+            break
+        parts.append(mention)
+        used += len(mention) + 1
+    return " ".join(parts)
+
+
+def _vote_embed(
+    vote: dict,
+    options: list[tuple[int, str, str | None]],
+    tally: dict[int, list[int]],
+) -> discord.Embed:
+    anonymous, closed = bool(vote["anonymous"]), bool(vote["closed"])
+    counts = {idx: len(tally.get(idx, [])) for idx, _, _ in options}
+    top = max(counts.values(), default=0)
+    voters = {uid for users in tally.values() for uid in users}
+
+    embed = discord.Embed(
+        title=f"🗳️ {vote['title']}",
+        color=0x99AAB5 if closed else 0x5865F2,
+    )
+    if closed:
+        embed.description = "🔒 This vote is closed."
+    elif vote["multiple"]:
+        embed.description = "Click any options to vote — toggle as many as you like."
+    else:
+        embed.description = "Click an option to vote — click again to change or clear it."
+
+    for idx, label, _dm in options:
+        count = counts[idx]
+        value = f"`{_bar(count, top)}` **{count}**"
+        if not anonymous and tally.get(idx):
+            value += f"\n{_join_mentions(tally[idx])}"
+        embed.add_field(name=f"{_num(idx)} {label}"[:256], value=value, inline=False)
+
+    kind = "Multiple choice" if vote["multiple"] else "Single choice"
+    privacy = "Anonymous" if anonymous else "Public"
+    people = f"{len(voters)} {'person' if len(voters) == 1 else 'people'} voted"
+    embed.set_footer(text=f"{privacy} · {kind} · {people}")
+    return embed
+
+
+class VoteView(discord.ui.View):
+    """Persistent view: one secondary button per option plus a close button.
+    Stateless beyond the vote id encoded in each button's custom_id, so it can
+    be rebuilt from the database after a restart."""
+
+    def __init__(
+        self, vote_id: int, options: list[tuple[int, str, str | None]], closed: bool = False
+    ) -> None:
+        super().__init__(timeout=None)
+        for idx, label, _dm in options:
+            button = discord.ui.Button(
+                label=f"{idx + 1}. {label}"[:_BUTTON_LABEL_MAX],
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"v:{vote_id}:{idx}",
+                disabled=closed,
+            )
+            button.callback = self._on_option
+            self.add_item(button)
+        close = discord.ui.Button(
+            label="Close vote", emoji="🔒",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"v:{vote_id}:close", disabled=closed,
+        )
+        close.callback = self._on_close
+        self.add_item(close)
+
+    async def _on_option(self, interaction: discord.Interaction) -> None:
+        await _handle_vote_click(interaction)
+
+    async def _on_close(self, interaction: discord.Interaction) -> None:
+        await _handle_vote_close(interaction)
+
+
+def _vote_id_from(interaction: discord.Interaction) -> tuple[int, str]:
+    _, vote_id, tail = interaction.data["custom_id"].split(":")
+    return int(vote_id), tail
+
+
+async def _handle_vote_click(interaction: discord.Interaction) -> None:
+    vote_id, tail = _vote_id_from(interaction)
+    vote = await storage.get_vote(vote_id)
+    if vote is None:
+        await interaction.response.send_message("This vote no longer exists.", ephemeral=True)
+        return
+    if vote["closed"]:
+        await interaction.response.send_message("This vote is closed.", ephemeral=True)
+        return
+
+    idx = int(tail)
+    options = await storage.get_vote_options(vote_id)
+    action = await storage.cast_ballot(vote_id, interaction.user.id, idx, bool(vote["multiple"]))
+    tally = await storage.get_ballots(vote_id)
+    await interaction.response.edit_message(
+        embed=_vote_embed(vote, options, tally), view=VoteView(vote_id, options)
+    )
+
+    label = next((lbl for i, lbl, _ in options if i == idx), "that option")
+    if action == "removed":
+        await interaction.followup.send(f"Removed your vote for **{label}**.", ephemeral=True)
+        return
+    dm_text = next((dm for i, _, dm in options if i == idx), None)
+    if not dm_text:
+        await interaction.followup.send(f"You voted for **{label}**.", ephemeral=True)
+        return
+    # Deliver the option's private message; fall back to an ephemeral reply
+    # (only the voter sees it) when their DMs are closed.
+    try:
+        await interaction.user.send(dm_text)
+        await interaction.followup.send(
+            f"You voted for **{label}** — I've sent you a DM.", ephemeral=True
+        )
+    except discord.Forbidden:
+        await interaction.followup.send(
+            f"You voted for **{label}**. (I couldn't DM you, so here it is:)\n\n{dm_text}",
+            ephemeral=True,
+        )
+
+
+async def _handle_vote_close(interaction: discord.Interaction) -> None:
+    vote_id, _ = _vote_id_from(interaction)
+    vote = await storage.get_vote(vote_id)
+    if vote is None:
+        await interaction.response.send_message("This vote no longer exists.", ephemeral=True)
+        return
+    if vote["closed"]:
+        await interaction.response.send_message("This vote is already closed.", ephemeral=True)
+        return
+    if interaction.user.id != vote["creator_id"] and not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message(
+            "Only the vote's creator or a server manager can close it.", ephemeral=True
+        )
+        return
+
+    await storage.close_vote(vote_id)
+    vote["closed"] = 1
+    options = await storage.get_vote_options(vote_id)
+    tally = await storage.get_ballots(vote_id)
+    await interaction.response.edit_message(
+        embed=_vote_embed(vote, options, tally), view=VoteView(vote_id, options, closed=True)
+    )
+    await _archive_vote_results(interaction, vote, options, tally)
+
+
+async def _archive_vote_results(
+    interaction: discord.Interaction,
+    vote: dict,
+    options: list[tuple[int, str, str | None]],
+    tally: dict[int, list[int]],
+) -> None:
+    """Post the final results to the admin channel; nudge the closer to set one
+    if it's missing. Anonymous votes stay anonymous in the copy too."""
+    channel = await _admin_channel()
+    if channel is None:
+        await interaction.followup.send(
+            "Vote closed. No admin channel is set, so I couldn't archive the results — "
+            "set one with `/admin set` and future results will be copied there.",
+            ephemeral=True,
+        )
+        return
+    jump = interaction.message.jump_url if interaction.message else ""
+    try:
+        await channel.send(
+            content=f"🗳️ **Vote results** — closed by {interaction.user.mention}"
+            + (f"\n{jump}" if jump else ""),
+            embed=_vote_embed(vote, options, tally),
+        )
+    except discord.HTTPException:
+        await interaction.followup.send(
+            "Vote closed, but I couldn't post to the admin channel — check my "
+            "permissions there.", ephemeral=True,
+        )
+        return
+    await interaction.followup.send(
+        "Vote closed — results archived to the admin channel.", ephemeral=True
+    )
+
+
+class VoteModal(discord.ui.Modal, title="Create a vote"):
+    vote_title = discord.ui.TextInput(
+        label="Title", placeholder="What are we deciding?", max_length=256
+    )
+    options = discord.ui.TextInput(
+        label="Options — one per line",
+        style=discord.TextStyle.paragraph,
+        placeholder="Pizza\nSushi | I'll DM the order link to sushi voters\nTacos",
+        max_length=4000,
+    )
+
+    def __init__(self, anonymous: bool, multiple: bool) -> None:
+        super().__init__()
+        self.anonymous = anonymous
+        self.multiple = multiple
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        options, error = _parse_vote_options(str(self.options))
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
+            return
+        vote_id = await storage.create_vote(
+            interaction.guild_id, interaction.channel_id, interaction.user.id,
+            str(self.vote_title).strip(), self.anonymous, self.multiple, options, int(time.time()),
+        )
+        vote = await storage.get_vote(vote_id)
+        opt_rows = await storage.get_vote_options(vote_id)
+        await interaction.response.send_message(
+            embed=_vote_embed(vote, opt_rows, {}), view=VoteView(vote_id, opt_rows)
+        )
+        message = await interaction.original_response()
+        await storage.set_vote_message(vote_id, message.id)
+
+
+@client.tree.command(
+    name="vote",
+    description="Start a button poll — opens a form for the title and options",
+)
+@app_commands.guild_only()
+@app_commands.describe(
+    visibility="Show who voted or keep it anonymous (default: public)",
+    mode="Allow one choice each or several (default: single choice)",
+)
+@app_commands.choices(
+    visibility=[
+        app_commands.Choice(name="Public — show who voted", value="public"),
+        app_commands.Choice(name="Anonymous — counts only", value="anon"),
+    ],
+    mode=[
+        app_commands.Choice(name="Single choice", value="single"),
+        app_commands.Choice(name="Multiple choice", value="multi"),
+    ],
+)
+async def vote_cmd(
+    interaction: discord.Interaction,
+    visibility: app_commands.Choice[str] | None = None,
+    mode: app_commands.Choice[str] | None = None,
+) -> None:
+    anonymous = visibility is not None and visibility.value == "anon"
+    multiple = mode is not None and mode.value == "multi"
+    await interaction.response.send_modal(VoteModal(anonymous, multiple))
 
 
 @client.tree.error
