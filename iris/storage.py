@@ -40,6 +40,9 @@ class Storage:
             await self._db.execute(
                 "ALTER TABLE voice_sessions ADD COLUMN source TEXT NOT NULL DEFAULT 'live'"
             )
+        vote_opt_cols = await columns("vote_options")
+        if vote_opt_cols and "role_id" not in vote_opt_cols:
+            await self._db.execute("ALTER TABLE vote_options ADD COLUMN role_id INTEGER")
 
     async def close(self) -> None:
         if self._db is not None:
@@ -91,10 +94,11 @@ class Storage:
         title: str,
         anonymous: bool,
         multiple: bool,
-        options: list[tuple[str, str | None]],
+        options: list[tuple[str, int | None, str | None]],
         created_utc: int,
     ) -> int:
-        """Insert a vote and its options (label, dm). Returns the new vote id."""
+        """Insert a vote and its options (label, role_id, message). Returns the
+        new vote id."""
         cur = await self.db.execute(
             "INSERT INTO votes"
             " (guild_id, channel_id, creator_id, title, anonymous, multiple, created_utc)"
@@ -103,8 +107,9 @@ class Storage:
         )
         vote_id = cur.lastrowid
         await self.db.executemany(
-            "INSERT INTO vote_options (vote_id, idx, label, dm) VALUES (?, ?, ?, ?)",
-            [(vote_id, i, label, dm) for i, (label, dm) in enumerate(options)],
+            "INSERT INTO vote_options (vote_id, idx, label, role_id, dm) VALUES (?, ?, ?, ?, ?)",
+            [(vote_id, i, label, role_id, message)
+             for i, (label, role_id, message) in enumerate(options)],
         )
         await self.db.commit()
         return vote_id
@@ -129,10 +134,13 @@ class Storage:
                 "anonymous", "multiple", "closed", "created_utc")
         return dict(zip(keys, row))
 
-    async def get_vote_options(self, vote_id: int) -> list[tuple[int, str, str | None]]:
-        """Rows of (idx, label, dm) in button order."""
+    async def get_vote_options(
+        self, vote_id: int
+    ) -> list[tuple[int, str, int | None, str | None]]:
+        """Rows of (idx, label, role_id, message) in button order. message is the
+        ephemeral note shown to the voter when they pick that option."""
         async with self.db.execute(
-            "SELECT idx, label, dm FROM vote_options WHERE vote_id = ? ORDER BY idx",
+            "SELECT idx, label, role_id, dm FROM vote_options WHERE vote_id = ? ORDER BY idx",
             (vote_id,),
         ) as cur:
             return await cur.fetchall()

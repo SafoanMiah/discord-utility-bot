@@ -862,12 +862,14 @@ client.tree.add_command(backlog_group)
 # -- /vote --------------------------------------------------------------------
 # A button poll. The command opens a modal for the title + options; each option
 # becomes a button. Results live in the message embed and update on every click.
-# An option line may carry a private DM after a " | " — whoever picks it gets
-# that message. Everything persists in the db, so votes survive restarts, and
-# closing a vote archives the results to the admin channel.
+# An option line is "Label | RoleID | Message": the role (if given) is granted
+# while that option is selected and dropped when it's deselected, and the
+# message (if given) is shown privately to the voter. Everything persists in the
+# db, so votes survive restarts, and closing a vote archives it to the admin
+# channel.
 
 MAX_VOTE_OPTIONS = 20         # 20 option buttons + a close button ≤ 25 per view
-_DM_DELIM = " | "
+_OPT_DELIM = " | "
 _LABEL_STORE_MAX = 200        # generous for the embed; button labels cap at 80
 _BUTTON_LABEL_MAX = 80        # Discord's hard limit
 _NUM_EMOJI = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
@@ -877,23 +879,37 @@ def _num(idx: int) -> str:
     return _NUM_EMOJI[idx] if idx < len(_NUM_EMOJI) else f"{idx + 1}."
 
 
-def _parse_vote_options(raw: str) -> tuple[list[tuple[str, str | None]], str | None]:
-    """Turn the modal's options box into (label, dm) pairs. Returns
-    (options, error); error is a user-facing message when the input is invalid.
-    Blank lines are ignored and duplicate labels dropped."""
-    options: list[tuple[str, str | None]] = []
+def _parse_vote_options(
+    raw: str,
+) -> tuple[list[tuple[str, int | None, str | None]], str | None]:
+    """Turn the modal's options box into (label, role_id, message) triples, one
+    per line as `Label | RoleID | Message` (role id and message optional; the
+    role id may be a raw id or an @role mention). Returns (options, error);
+    error is a user-facing message when the input is invalid. Blank lines are
+    ignored and duplicate labels dropped."""
+    options: list[tuple[str, int | None, str | None]] = []
     seen: set[str] = set()
     for line in raw.splitlines():
         line = line.strip()
         if not line:
             continue
-        label, sep, dm = line.partition(_DM_DELIM)
-        label = label.strip()
-        dm = dm.strip()
+        parts = [p.strip() for p in line.split(_OPT_DELIM, 2)]
+        label = parts[0]
+        role_part = parts[1] if len(parts) > 1 else ""
+        message = parts[2] if len(parts) > 2 else ""
         if not label or label.casefold() in seen:
             continue
+        role_id: int | None = None
+        if role_part:
+            digits = re.sub(r"\D", "", role_part)  # accepts a raw id or <@&id>
+            if not digits:
+                return [], (
+                    f"“{role_part}” isn't a valid role — use the role's id or an "
+                    "@role mention (turn on Developer Mode to copy an id)."
+                )
+            role_id = int(digits)
         seen.add(label.casefold())
-        options.append((label[:_LABEL_STORE_MAX], dm or None))
+        options.append((label[:_LABEL_STORE_MAX], role_id, message or None))
     if len(options) < 2:
         return [], "A vote needs at least 2 options — put one per line."
     if len(options) > MAX_VOTE_OPTIONS:
@@ -923,11 +939,11 @@ def _join_mentions(user_ids: list[int], budget: int = 900) -> str:
 
 def _vote_embed(
     vote: dict,
-    options: list[tuple[int, str, str | None]],
+    options: list[tuple[int, str, int | None, str | None]],
     tally: dict[int, list[int]],
 ) -> discord.Embed:
     anonymous, closed = bool(vote["anonymous"]), bool(vote["closed"])
-    counts = {idx: len(tally.get(idx, [])) for idx, _, _ in options}
+    counts = {idx: len(tally.get(idx, [])) for idx, *_ in options}
     top = max(counts.values(), default=0)
     voters = {uid for users in tally.values() for uid in users}
 
@@ -942,7 +958,7 @@ def _vote_embed(
     else:
         embed.description = "Click an option to vote — click again to change or clear it."
 
-    for idx, label, _dm in options:
+    for idx, label, _role, _msg in options:
         count = counts[idx]
         value = f"`{_bar(count, top)}` **{count}**"
         if not anonymous and tally.get(idx):
@@ -962,10 +978,13 @@ class VoteView(discord.ui.View):
     be rebuilt from the database after a restart."""
 
     def __init__(
-        self, vote_id: int, options: list[tuple[int, str, str | None]], closed: bool = False
+        self,
+        vote_id: int,
+        options: list[tuple[int, str, int | None, str | None]],
+        closed: bool = False,
     ) -> None:
         super().__init__(timeout=None)
-        for idx, label, _dm in options:
+        for idx, label, _role, _msg in options:
             button = discord.ui.Button(
                 label=f"{idx + 1}. {label}"[:_BUTTON_LABEL_MAX],
                 style=discord.ButtonStyle.secondary,
@@ -994,44 +1013,74 @@ def _vote_id_from(interaction: discord.Interaction) -> tuple[int, str]:
     return int(vote_id), tail
 
 
+async def _sync_vote_roles(
+    interaction: discord.Interaction,
+    options: list[tuple[int, str, int | None, str | None]],
+    user_idxs: set[int],
+) -> str | None:
+    """Make the voter's roles match their current selections: grant the role of
+    every option they've picked and strip this vote's other roles. Returns a
+    short note for the ephemeral reply, or None if nothing changed."""
+    member, guild = interaction.user, interaction.guild
+    if guild is None or not isinstance(member, discord.Member):
+        return None
+    vote_role_ids = {rid for _i, _l, rid, _m in options if rid}
+    if not vote_role_ids:
+        return None
+    want_ids = {rid for idx, _l, rid, _m in options if rid and idx in user_idxs}
+    have_ids = {r.id for r in member.roles}
+    add = [role for rid in (want_ids - have_ids) if (role := guild.get_role(rid))]
+    drop = [role for rid in ((vote_role_ids - want_ids) & have_ids) if (role := guild.get_role(rid))]
+    if not add and not drop:
+        return None
+    try:
+        if add:
+            await member.add_roles(*add, reason="Iris vote selection")
+        if drop:
+            await member.remove_roles(*drop, reason="Iris vote deselection")
+    except discord.Forbidden:
+        return ("⚠️ I couldn't update your roles — I need **Manage Roles**, and the "
+                "role must sit below my highest role.")
+    notes = []
+    if add:
+        notes.append("➕ " + ", ".join(r.mention for r in add))
+    if drop:
+        notes.append("➖ " + ", ".join(r.mention for r in drop))
+    return " · ".join(notes)
+
+
 async def _handle_vote_click(interaction: discord.Interaction) -> None:
     vote_id, tail = _vote_id_from(interaction)
+    # Acknowledge before any DB work: commits on slow hosts can exceed Discord's
+    # 3-second response window (that was the "Unknown interaction" crash).
+    await interaction.response.defer()
     vote = await storage.get_vote(vote_id)
-    if vote is None:
-        await interaction.response.send_message("This vote no longer exists.", ephemeral=True)
-        return
-    if vote["closed"]:
-        await interaction.response.send_message("This vote is closed.", ephemeral=True)
+    if vote is None or vote["closed"]:
+        await interaction.followup.send(
+            "This vote is closed or no longer exists.", ephemeral=True
+        )
         return
 
     idx = int(tail)
     options = await storage.get_vote_options(vote_id)
     action = await storage.cast_ballot(vote_id, interaction.user.id, idx, bool(vote["multiple"]))
     tally = await storage.get_ballots(vote_id)
-    await interaction.response.edit_message(
+    await interaction.edit_original_response(
         embed=_vote_embed(vote, options, tally), view=VoteView(vote_id, options)
     )
 
-    label = next((lbl for i, lbl, _ in options if i == idx), "that option")
-    if action == "removed":
-        await interaction.followup.send(f"Removed your vote for **{label}**.", ephemeral=True)
-        return
-    dm_text = next((dm for i, _, dm in options if i == idx), None)
-    if not dm_text:
-        await interaction.followup.send(f"You voted for **{label}**.", ephemeral=True)
-        return
-    # Deliver the option's private message; fall back to an ephemeral reply
-    # (only the voter sees it) when their DMs are closed.
-    try:
-        await interaction.user.send(dm_text)
-        await interaction.followup.send(
-            f"You voted for **{label}** — I've sent you a DM.", ephemeral=True
-        )
-    except discord.Forbidden:
-        await interaction.followup.send(
-            f"You voted for **{label}**. (I couldn't DM you, so here it is:)\n\n{dm_text}",
-            ephemeral=True,
-        )
+    label = next((lbl for i, lbl, _r, _m in options if i == idx), "that option")
+    message = next((msg for i, _l, _r, msg in options if i == idx), None)
+    user_idxs = {i for i, users in tally.items() if interaction.user.id in users}
+    role_note = await _sync_vote_roles(interaction, options, user_idxs)
+
+    lines = [f"Removed your vote for **{label}**." if action == "removed"
+             else f"You voted for **{label}**."]
+    if action != "removed" and message:
+        lines.append(message)
+    if role_note:
+        lines.append(role_note)
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 
 async def _handle_vote_close(interaction: discord.Interaction) -> None:
@@ -1049,11 +1098,12 @@ async def _handle_vote_close(interaction: discord.Interaction) -> None:
         )
         return
 
+    await interaction.response.defer()
     await storage.close_vote(vote_id)
     vote["closed"] = 1
     options = await storage.get_vote_options(vote_id)
     tally = await storage.get_ballots(vote_id)
-    await interaction.response.edit_message(
+    await interaction.edit_original_response(
         embed=_vote_embed(vote, options, tally), view=VoteView(vote_id, options, closed=True)
     )
     await _archive_vote_results(interaction, vote, options, tally)
@@ -1062,7 +1112,7 @@ async def _handle_vote_close(interaction: discord.Interaction) -> None:
 async def _archive_vote_results(
     interaction: discord.Interaction,
     vote: dict,
-    options: list[tuple[int, str, str | None]],
+    options: list[tuple[int, str, int | None, str | None]],
     tally: dict[int, list[int]],
 ) -> None:
     """Post the final results to the admin channel; nudge the closer to set one
@@ -1098,9 +1148,9 @@ class VoteModal(discord.ui.Modal, title="Create a vote"):
         label="Title", placeholder="What are we deciding?", max_length=256
     )
     options = discord.ui.TextInput(
-        label="Options — one per line",
+        label="Options (Label | RoleID | Message) — 1/line",
         style=discord.TextStyle.paragraph,
-        placeholder="Pizza\nSushi | I'll DM the order link to sushi voters\nTacos",
+        placeholder="Attend | 123456789012 | See you Friday!\nMaybe\nCan't make it",
         max_length=4000,
     )
 
@@ -1114,16 +1164,18 @@ class VoteModal(discord.ui.Modal, title="Create a vote"):
         if error:
             await interaction.response.send_message(error, ephemeral=True)
             return
+        # Ack before touching the DB: commits on slow hosts can blow past the
+        # 3-second interaction window (that was the "Unknown interaction" crash).
+        await interaction.response.defer(thinking=True)
         vote_id = await storage.create_vote(
             interaction.guild_id, interaction.channel_id, interaction.user.id,
             str(self.vote_title).strip(), self.anonymous, self.multiple, options, int(time.time()),
         )
         vote = await storage.get_vote(vote_id)
         opt_rows = await storage.get_vote_options(vote_id)
-        await interaction.response.send_message(
+        message = await interaction.edit_original_response(
             embed=_vote_embed(vote, opt_rows, {}), view=VoteView(vote_id, opt_rows)
         )
-        message = await interaction.original_response()
         await storage.set_vote_message(vote_id, message.id)
 
 

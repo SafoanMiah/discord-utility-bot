@@ -66,7 +66,8 @@ CREATE TABLE IF NOT EXISTS vote_options (
   vote_id  INTEGER NOT NULL,
   idx      INTEGER NOT NULL,                  -- 0-based position / button order
   label    TEXT NOT NULL,
-  dm       TEXT,                              -- optional message DM'd on selection
+  dm       TEXT,                              -- optional ephemeral note shown to the voter on selection
+  role_id  INTEGER,                           -- optional role granted while this option is selected
   PRIMARY KEY (vote_id, idx)
 );
 

@@ -62,15 +62,20 @@ Bots and opted-out people are never tracked, backfills included.
 ### Votes
 
 `/vote` posts a poll with a button per option; the embed tallies live as people
-click. Options go one per line in the form. Add ` | ` after an option and Iris
-will DM that text to whoever picks it (handy for links or instructions) —
-falling back to a private reply if their DMs are closed:
+click. Options go one per line as `Label | RoleID | Message` — the role id and
+message are both optional:
 
 ```
-Attend | See you Friday 7pm — here's the link: https://…
+Attend | 123456789012345678 | See you Friday 7pm!
 Maybe
 Can't make it
 ```
+
+Picking an option that has a **role id** grants that role (and it's removed if
+they change or clear their vote — so it doubles as a self-assign role menu);
+the id can be a raw id or an `@role` mention. If an option has a **message**,
+the voter gets it as a private, only-they-can-see reply where they clicked (no
+DMs). Iris needs **Manage Roles**, with those roles below its own top role.
 
 Public votes list who chose each option; anonymous ones show only counts. When
 the creator or a manager closes a vote, the final results are copied to the
