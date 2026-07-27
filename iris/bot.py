@@ -1131,6 +1131,7 @@ class VoteModal(discord.ui.Modal, title="Create a vote"):
     name="vote",
     description="Start a button poll — opens a form for the title and options",
 )
+@app_commands.default_permissions(manage_guild=True)
 @app_commands.guild_only()
 @app_commands.describe(
     visibility="Show who voted or keep it anonymous (default: public)",

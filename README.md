@@ -48,7 +48,7 @@ stores anyone's messages.
 | `/timezone show` / `clear` | Check or remove it |
 | `/privacy optout` | Stop tracking and delete everything Iris has on you |
 | `/privacy optin` | Start tracking again (deleted data stays deleted) |
-| `/vote` | Start a button poll. Opens a form for the title and options; pick public/anonymous and single/multiple choice |
+| `/vote` | Start a button poll: title, options, public/anonymous, single/multiple choice (managers only; anyone can then vote) |
 | `/backlog chats` | Fill in past message activity from channel history (managers only) |
 | `/admin set #channel` | Set the channel for backups and alerts (managers only) |
 | `/admin show` | Show the current admin channel (managers only) |
