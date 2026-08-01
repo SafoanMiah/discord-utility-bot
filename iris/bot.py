@@ -389,12 +389,13 @@ def _build_activity_png(name, msgs, sessions, tz, tz_label, day_index):
     )
 
 
-def _build_games_png(name, game_sessions):
+def _build_games_png(name, game_sessions, subtitle, since):
     """Sync: aggregation + render, run via asyncio.to_thread. game_sessions is
-    a list of (game, start_utc, end_utc); totals are timezone-independent."""
-    return charts.render_games(
-        name, "Top games · all time", analysis.game_totals(game_sessions)
-    )
+    a list of (game, start_utc, end_utc); totals are timezone-independent.
+    Sessions straddling `since` are clipped so only in-window time counts."""
+    if since is not None:
+        game_sessions = [(g, max(s, since), e) for g, s, e in game_sessions]
+    return charts.render_games(name, subtitle, analysis.game_totals(game_sessions))
 
 
 def _build_stats_png(name, msgs, sessions, tz, tz_label, joined: date | None):
@@ -544,8 +545,16 @@ async def stats_card(interaction: discord.Interaction, user: discord.Member) -> 
 
 
 @stats_group.command(name="games", description="Most-played games for a member")
-@app_commands.describe(user="Member to view")
-async def stats_games(interaction: discord.Interaction, user: discord.Member) -> None:
+@app_commands.describe(user="Member to view", period="Only count recent play")
+@app_commands.choices(period=[
+    app_commands.Choice(name="Last 7 days", value=7),
+    app_commands.Choice(name="Last 30 days", value=30),
+])
+async def stats_games(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    period: app_commands.Choice[int] | None = None,
+) -> None:
     await interaction.response.defer()
     if user.bot:
         await interaction.followup.send("Bots aren't tracked.")
@@ -553,13 +562,26 @@ async def stats_games(interaction: discord.Interaction, user: discord.Member) ->
     if await storage.is_opted_out(user.id):
         await interaction.followup.send("No data — this user has opted out.")
         return
-    game_sessions = await storage.get_game_sessions(user.id, interaction.guild_id)
+    since = int(time.time()) - period.value * 86400 if period is not None else None
+    game_sessions = await storage.get_game_sessions(
+        user.id, interaction.guild_id, since=since
+    )
     if not game_sessions:
+        window = f" in the last {period.value} days" if period is not None else " yet"
         await interaction.followup.send(
-            f"No game activity recorded for **{user.display_name}** yet."
+            f"No game activity recorded for **{user.display_name}**{window}."
         )
         return
-    png = await asyncio.to_thread(_build_games_png, user.display_name, game_sessions)
+    if period is not None:
+        subtitle = f"Top games · last {period.value} days"
+    else:
+        # Presence tracking began well after the server did, so "all time"
+        # would overpromise; date the record from the first session instead.
+        first = datetime.fromtimestamp(game_sessions[0][1], timezone.utc).date()
+        subtitle = f"Top games · since {_fmt_date(first)}"
+    png = await asyncio.to_thread(
+        _build_games_png, user.display_name, game_sessions, subtitle, since
+    )
     await interaction.followup.send(file=discord.File(png, filename="games.png"))
 
 

@@ -74,7 +74,8 @@ def main() -> None:
             "quietone", msgs[:400], [], tz, "Europe/London", None),
         "stats.png": _build_stats_png(
             "moonlace", msgs, sessions, tz, "Europe/London", date(2024, 11, 3)),
-        "games.png": _build_games_png("moonlace", fake_games()),
+        "games.png": _build_games_png(
+            "moonlace", fake_games(), "Top games · since 3 Nov 2024", None),
     }
     for filename, buf in renders.items():
         (OUT / filename).write_bytes(buf.getvalue())
