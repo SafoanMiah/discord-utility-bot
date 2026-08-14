@@ -78,6 +78,27 @@ CREATE TABLE IF NOT EXISTS vote_ballots (
   PRIMARY KEY (vote_id, user_id, idx)         -- single-choice enforced in code
 );
 
+-- /unmute shields. While a row is live, Iris reverses any server mute or
+-- deafen landing on that member. Rows are dropped once they expire; the
+-- in-memory copy in bot.py is what the voice event actually checks, so this
+-- table exists purely so shields survive a restart.
+CREATE TABLE IF NOT EXISTS unmute_shields (
+  guild_id     INTEGER NOT NULL,
+  user_id      INTEGER NOT NULL,
+  granted_by   INTEGER NOT NULL,
+  granted_utc  INTEGER NOT NULL,
+  expires_utc  INTEGER NOT NULL,
+  PRIMARY KEY (guild_id, user_id)
+);
+
+-- When each member last spent a /unmute, for the once-a-day limit.
+CREATE TABLE IF NOT EXISTS unmute_uses (
+  guild_id  INTEGER NOT NULL,
+  user_id   INTEGER NOT NULL,
+  last_utc  INTEGER NOT NULL,
+  PRIMARY KEY (guild_id, user_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id, guild_id, ts_utc);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_mid ON messages(message_id)
   WHERE message_id IS NOT NULL;

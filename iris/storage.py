@@ -200,6 +200,68 @@ class Storage:
         ) as cur:
             return await cur.fetchall()
 
+    # -- /unmute shields ----------------------------------------------------
+
+    async def grant_unmute_shield(
+        self,
+        guild_id: int,
+        user_id: int,
+        granted_by: int,
+        granted_utc: int,
+        expires_utc: int,
+    ) -> None:
+        """Start (or restart) a shield for one member. One shield per member."""
+        await self.db.execute(
+            "INSERT INTO unmute_shields"
+            " (guild_id, user_id, granted_by, granted_utc, expires_utc)"
+            " VALUES (?, ?, ?, ?, ?)"
+            " ON CONFLICT(guild_id, user_id) DO UPDATE SET"
+            " granted_by = excluded.granted_by, granted_utc = excluded.granted_utc,"
+            " expires_utc = excluded.expires_utc",
+            (guild_id, user_id, granted_by, granted_utc, expires_utc),
+        )
+        await self.db.commit()
+
+    async def clear_unmute_shield(self, guild_id: int, user_id: int) -> None:
+        await self.db.execute(
+            "DELETE FROM unmute_shields WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id),
+        )
+        await self.db.commit()
+
+    async def get_active_unmute_shields(self, now: int) -> list[tuple[int, int, int]]:
+        """(guild_id, user_id, expires_utc) for shields that haven't run out —
+        read once at startup to rebuild the in-memory set."""
+        async with self.db.execute(
+            "SELECT guild_id, user_id, expires_utc FROM unmute_shields WHERE expires_utc > ?",
+            (now,),
+        ) as cur:
+            return await cur.fetchall()
+
+    async def purge_expired_unmute_shields(self, now: int) -> int:
+        cur = await self.db.execute(
+            "DELETE FROM unmute_shields WHERE expires_utc <= ?", (now,)
+        )
+        await self.db.commit()
+        return cur.rowcount
+
+    async def get_last_unmute_use(self, guild_id: int, user_id: int) -> int | None:
+        """When this member last spent a /unmute here, or None if never."""
+        async with self.db.execute(
+            "SELECT last_utc FROM unmute_uses WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return row[0] if row else None
+
+    async def record_unmute_use(self, guild_id: int, user_id: int, ts_utc: int) -> None:
+        await self.db.execute(
+            "INSERT INTO unmute_uses (guild_id, user_id, last_utc) VALUES (?, ?, ?)"
+            " ON CONFLICT(guild_id, user_id) DO UPDATE SET last_utc = excluded.last_utc",
+            (guild_id, user_id, ts_utc),
+        )
+        await self.db.commit()
+
     # -- timezones ----------------------------------------------------------
 
     async def set_timezone(self, user_id: int, tz: str) -> None:

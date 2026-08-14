@@ -12,6 +12,43 @@ def test_game_session_flow(tmp_path):
     asyncio.run(_game_flow(str(tmp_path / "games.db")))
 
 
+def test_unmute_shield_flow(tmp_path):
+    asyncio.run(_unmute_flow(str(tmp_path / "unmute.db")))
+
+
+async def _unmute_flow(db_path: str) -> None:
+    s = Storage(db_path)
+    await s.open()
+
+    # a shield is one row per member, restartable and guild-scoped
+    assert await s.get_active_unmute_shields(1000) == []
+    await s.grant_unmute_shield(10, 1, granted_by=2, granted_utc=1000, expires_utc=1600)
+    await s.grant_unmute_shield(99, 1, granted_by=2, granted_utc=1000, expires_utc=1600)
+    assert sorted(await s.get_active_unmute_shields(1000)) == [(10, 1, 1600), (99, 1, 1600)]
+
+    # re-granting extends the same row rather than stacking a second one
+    await s.grant_unmute_shield(10, 1, granted_by=3, granted_utc=1500, expires_utc=2100)
+    assert sorted(await s.get_active_unmute_shields(1500)) == [(10, 1, 2100), (99, 1, 1600)]
+
+    # expiry is exclusive of "now", and the sweep only takes what's run out
+    assert await s.get_active_unmute_shields(1600) == [(10, 1, 2100)]
+    assert await s.purge_expired_unmute_shields(1600) == 1
+    assert await s.get_active_unmute_shields(1000) == [(10, 1, 2100)]
+
+    await s.clear_unmute_shield(10, 1)
+    assert await s.get_active_unmute_shields(1000) == []
+
+    # daily-use stamps: per member, per guild, last write wins
+    assert await s.get_last_unmute_use(10, 2) is None
+    await s.record_unmute_use(10, 2, 1000)
+    assert await s.get_last_unmute_use(10, 2) == 1000
+    assert await s.get_last_unmute_use(99, 2) is None
+    await s.record_unmute_use(10, 2, 90_000)
+    assert await s.get_last_unmute_use(10, 2) == 90_000
+
+    await s.close()
+
+
 async def _game_flow(db_path: str) -> None:
     s = Storage(db_path)
     await s.open()

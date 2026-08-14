@@ -46,6 +46,7 @@ stores anyone's messages.
 | `/stats games @user` | Their most-played games, ranked by time |
 | `/timezone set` | Set your timezone so charts show your local time |
 | `/timezone show` / `clear` | Check or remove it |
+| `/unmute @user` | Shields them for 10 minutes: any server mute or deafen gets undone instantly. Once a day each, admins unlimited |
 | `/privacy optout` | Stop tracking and delete everything Iris has on you |
 | `/privacy optin` | Start tracking again (deleted data stays deleted) |
 | `/vote` | Start a button poll: title, options, public/anonymous, single/multiple choice (managers only; anyone can then vote) |
@@ -80,6 +81,31 @@ DMs). Iris needs **Manage Roles**, with those roles below its own top role.
 Public votes list who chose each option; anonymous ones show only counts. When
 the creator or a manager closes a vote, the final results are copied to the
 admin channel (anonymous votes stay anonymous there too).
+
+### Unmute shields
+
+Everyone on this server has Administrator, so anyone can server mute or deafen
+anyone. `/unmute @user` is the counterweight: it puts a **shield** on them for
+10 minutes, and while it's up Iris undoes any server mute or deafen the instant
+it lands - including one applied before the shield went up, and including a
+mute they carry back in when they rejoin voice. It's public on purpose, so the
+room can see the shield is up.
+
+Anyone can use it, on anyone, themselves included. **Once every 24 hours** per
+person - except anyone with **Administrator** or **Manage Server**, who has no
+limit. Since everyone here is an admin, that means nobody is limited today; the
+limit starts biting the moment you tighten permissions. Shielding someone who
+is already shielded doesn't cost you your daily use.
+
+Iris needs **Mute Members** and **Deafen Members**, and its role has to sit
+above the shielded member's top role - otherwise Discord refuses the unmute.
+`/unmute` checks both up front and says so rather than failing silently later.
+The server owner is the one person who can't be shielded - Discord won't let a
+bot change the owner's voice state at all.
+
+If someone re-mutes on a loop, Iris stops after 25 undos in one window and
+drops the shield instead of trading edits with them forever. Shields live in
+the database, so a restart mid-window doesn't lose them.
 
 ## Good to know
 

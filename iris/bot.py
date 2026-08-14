@@ -61,10 +61,22 @@ class IrisClient(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.opted_out: set[int] = set()
         self._voice_recovered = False
+        # Live /unmute shields, (guild_id, user_id) -> expiry. Kept in memory
+        # because on_voice_state_update fires constantly (every self-mute,
+        # camera toggle…) and must not hit the database each time; the table
+        # is only there so shields survive a restart.
+        self.unmute_shields: dict[tuple[int, int], int] = {}
+        self._unmute_undos: dict[tuple[int, int], int] = {}
 
     async def setup_hook(self) -> None:
         await storage.open()
         self.opted_out = await storage.get_opted_out_ids()
+        now = int(time.time())
+        await storage.purge_expired_unmute_shields(now)
+        self.unmute_shields = {
+            (guild_id, user_id): expires
+            for guild_id, user_id, expires in await storage.get_active_unmute_shields(now)
+        }
         # Re-attach button views to still-open votes so they keep working
         # across restarts (persistent views, keyed by their message id).
         for vote_id, message_id in await storage.get_open_votes():
@@ -107,6 +119,11 @@ class IrisClient(discord.Client):
         before: discord.VoiceState,
         after: discord.VoiceState,
     ) -> None:
+        # Shields come first: a server mute is exactly the kind of change the
+        # tracking below discards, and it applies to opted-out members too
+        # (it's a moderation action, not something Iris records).
+        if after.channel is not None and (after.mute or after.deaf):
+            await self.enforce_unmute_shield(member, after)
         if member.bot or member.id in self.opted_out:
             return
         if before.channel == after.channel:
@@ -192,6 +209,62 @@ class IrisClient(discord.Client):
             for game in _playing_games(member)
         ]
 
+    # -- /unmute shields -------------------------------------------------------
+
+    def shield_expiry(self, guild_id: int, user_id: int) -> int | None:
+        """When this member's shield runs out, or None if they have none."""
+        return self.unmute_shields.get((guild_id, user_id))
+
+    async def add_unmute_shield(
+        self, guild_id: int, user_id: int, granted_by: int, now: int, expires: int
+    ) -> None:
+        await storage.grant_unmute_shield(guild_id, user_id, granted_by, now, expires)
+        self.unmute_shields[(guild_id, user_id)] = expires
+        self._unmute_undos.pop((guild_id, user_id), None)
+
+    async def drop_unmute_shield(self, guild_id: int, user_id: int) -> None:
+        self.unmute_shields.pop((guild_id, user_id), None)
+        self._unmute_undos.pop((guild_id, user_id), None)
+        await storage.clear_unmute_shield(guild_id, user_id)
+
+    async def expire_unmute_shields(self, now: int) -> None:
+        """Drop shields whose time is up. Called from the heartbeat; the event
+        path also checks expiry itself, so this is only housekeeping."""
+        expired = [key for key, expires in self.unmute_shields.items() if expires <= now]
+        for key in expired:
+            self.unmute_shields.pop(key, None)
+            self._unmute_undos.pop(key, None)
+        if expired:
+            await storage.purge_expired_unmute_shields(now)
+
+    async def enforce_unmute_shield(
+        self, member: discord.Member, state: discord.VoiceState
+    ) -> None:
+        """A shielded member just got server muted or deafened — undo it."""
+        key = (member.guild.id, member.id)
+        expires = self.unmute_shields.get(key)
+        if expires is None:
+            return
+        if int(time.time()) >= expires:
+            await self.drop_unmute_shield(*key)
+            return
+        undos = self._unmute_undos.get(key, 0)
+        if undos >= config.UNMUTE_MAX_UNDOS:
+            # Someone is re-muting on a loop. Stand down rather than trade
+            # edits with them for the rest of the window.
+            log.warning(
+                "Unmute shield for %s in guild %s hit %d undos; standing down",
+                member.id, member.guild.id, undos,
+            )
+            await self.drop_unmute_shield(*key)
+            return
+        self._unmute_undos[key] = undos + 1
+        problem = await _undo_server_mute(member, state, "Iris /unmute shield")
+        if problem:
+            log.warning("Unmute shield for %s failed: %s", member.id, problem)
+        else:
+            log.info("Unmute shield: cleared %s on %s", _mute_words(state), member.id)
+
 
 def _playing_games(member: discord.Member) -> set[str]:
     """The named games a member is currently playing (Rich Presence). Excludes
@@ -211,6 +284,7 @@ async def heartbeat_loop() -> None:
     now = int(time.time())
     await storage.heartbeat(client.members_in_voice(), now)
     await storage.heartbeat_games(client.members_playing(), now)
+    await client.expire_unmute_shields(now)
 
 
 # -- admin channel & database backups ------------------------------------------
@@ -1229,6 +1303,133 @@ async def vote_cmd(
     anonymous = visibility is not None and visibility.value == "anon"
     multiple = mode is not None and mode.value == "multi"
     await interaction.response.send_modal(VoteModal(anonymous, multiple))
+
+
+# -- /unmute ------------------------------------------------------------------
+# Everyone here has Administrator, so anyone can server mute or deafen anyone.
+# /unmute is the counterweight: it puts a short shield on a member, and for as
+# long as that shield is up Iris undoes any server mute or deafen the moment it
+# lands. One per member per day, except for admins (see _unmute_bypass).
+
+_SHIELD_MINUTES = config.UNMUTE_SHIELD_SECONDS // 60
+
+
+def _mute_words(state: discord.VoiceState) -> str:
+    if state.mute and state.deaf:
+        return "server mute and deafen"
+    return "server deafen" if state.deaf else "server mute"
+
+
+async def _undo_server_mute(
+    member: discord.Member, state: discord.VoiceState, reason: str
+) -> str | None:
+    """Lift whichever of server mute/deafen is currently set on `member`.
+    Returns None on success, or a user-facing reason it couldn't be done."""
+    changes: dict[str, bool] = {}
+    if state.mute:
+        changes["mute"] = False
+    if state.deaf:
+        changes["deafen"] = False  # Member.edit spells it 'deafen'; VoiceState 'deaf'
+    if not changes:
+        return None
+    try:
+        await member.edit(**changes, reason=reason)
+    except discord.Forbidden:
+        return (
+            f"Discord won't let me change {member.display_name}'s voice state — I need "
+            "**Mute Members** and **Deafen Members**, and my top role has to sit above theirs."
+        )
+    except discord.HTTPException as exc:
+        return f"Discord refused the unmute ({exc.text or exc})."
+    return None
+
+
+def _shield_blocker(guild: discord.Guild, member: discord.Member) -> str | None:
+    """Why a shield on this member wouldn't work, checked up front so people
+    find out when they raise it rather than when they need it."""
+    me = guild.me
+    missing = [
+        name
+        for name, granted in (
+            ("Mute Members", me.guild_permissions.mute_members),
+            ("Deafen Members", me.guild_permissions.deafen_members),
+        )
+        if not granted
+    ]
+    if missing:
+        return (
+            "I don't have " + " or ".join(f"**{name}**" for name in missing)
+            + " in this server, so I can't lift a mute. Grant it and the shield starts working."
+        )
+    if member.id == guild.owner_id:
+        return "They own the server — Discord won't let me change the owner's voice state."
+    if me.top_role <= member.top_role:
+        return (
+            f"{member.display_name}'s top role sits above mine, so Discord will refuse the "
+            "unmute. Drag my role higher in Server Settings → Roles to fix it."
+        )
+    return None
+
+
+def _unmute_bypass(user: discord.Member | discord.User) -> bool:
+    """Admins aren't rate limited. On a server where everyone is an admin that
+    means everyone — the daily limit only starts biting once perms are tightened."""
+    perms = getattr(user, "guild_permissions", None)
+    return bool(perms and (perms.administrator or perms.manage_guild))
+
+
+@client.tree.command(
+    name="unmute",
+    description=f"Undo any server mute or deafen on someone for {_SHIELD_MINUTES} minutes",
+)
+@app_commands.guild_only()
+@app_commands.describe(user="Member to shield — mutes and deafens on them get reversed instantly")
+async def unmute_cmd(interaction: discord.Interaction, user: discord.Member) -> None:
+    guild = interaction.guild
+    if user.bot:
+        await interaction.response.send_message("Bots can't be shielded.", ephemeral=True)
+        return
+
+    now = int(time.time())
+    live = client.shield_expiry(guild.id, user.id)
+    if live is not None and live > now:
+        await interaction.response.send_message(
+            f"{user.display_name} is already shielded — it runs out <t:{live}:R>. "
+            "Your daily `/unmute` is untouched.",
+            ephemeral=True,
+        )
+        return
+
+    if not _unmute_bypass(interaction.user):
+        last_used = await storage.get_last_unmute_use(guild.id, interaction.user.id)
+        if last_used is not None and now - last_used < config.UNMUTE_COOLDOWN_SECONDS:
+            ready = last_used + config.UNMUTE_COOLDOWN_SECONDS
+            await interaction.response.send_message(
+                f"You've already used your `/unmute` today — you get another <t:{ready}:R>.",
+                ephemeral=True,
+            )
+            return
+
+    # Ack before the writes: commits on slow hosts can outrun Discord's
+    # 3-second response window.
+    await interaction.response.defer()
+    expires = now + config.UNMUTE_SHIELD_SECONDS
+    await client.add_unmute_shield(guild.id, user.id, interaction.user.id, now, expires)
+    await storage.record_unmute_use(guild.id, interaction.user.id, now)
+
+    lines = [
+        f"🛡️ {interaction.user.mention} shielded **{user.display_name}** for "
+        f"{_SHIELD_MINUTES} minutes — any server mute or deafen on them gets undone "
+        f"immediately until <t:{expires}:t> (<t:{expires}:R>)."
+    ]
+    blocker = _shield_blocker(guild, user)
+    if blocker:
+        lines.append(f"⚠️ {blocker}")
+    elif user.voice is not None and (user.voice.mute or user.voice.deaf):
+        was = _mute_words(user.voice)
+        problem = await _undo_server_mute(user, user.voice, f"Iris /unmute by {interaction.user}")
+        lines.append(f"⚠️ {problem}" if problem else f"They were under a {was} — lifted it.")
+    await interaction.followup.send("\n".join(lines))
 
 
 @client.tree.error
