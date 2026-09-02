@@ -203,15 +203,28 @@ class Storage:
         await self.db.commit()
         return cur.rowcount
 
-    async def earliest_live_voice_start(self, guild_id: int) -> int | None:
-        """When Iris's own voice capture began — imports are capped here so
-        they can never overlap live-recorded sessions."""
+    async def live_voice_intervals(self, guild_id: int) -> list[tuple[int, int]]:
+        """The spans Iris's own voice capture already recorded, merged into
+        sorted non-overlapping intervals. Imports are trimmed against these
+        rather than a single earliest-session boundary, so a stretch when the
+        bot was down still backfills while live time is never double counted.
+        An open session is treated as covered up to its last heartbeat."""
         async with self.db.execute(
-            "SELECT MIN(start_utc) FROM voice_sessions WHERE guild_id = ? AND source = 'live'",
+            "SELECT start_utc, COALESCE(end_utc, last_heartbeat_utc, start_utc)"
+            " FROM voice_sessions WHERE guild_id = ? AND source = 'live'"
+            " ORDER BY start_utc",
             (guild_id,),
         ) as cur:
-            row = await cur.fetchone()
-        return row[0] if row else None
+            rows = await cur.fetchall()
+
+        merged: list[tuple[int, int]] = []
+        for start, end in rows:
+            if merged and start <= merged[-1][1]:
+                if end > merged[-1][1]:
+                    merged[-1] = (merged[-1][0], end)
+            else:
+                merged.append((start, end))
+        return merged
 
     async def get_open_sessions(self) -> list[tuple[int, int, int, int]]:
         """Rows of (user_id, guild_id, channel_id, start_utc) still open."""

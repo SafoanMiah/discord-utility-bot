@@ -681,8 +681,8 @@ async def _run_vc_backfill(
 
     events = [e for e in events if tracked(e[1])]
 
-    cutoff = await storage.earliest_live_voice_start(guild.id)
-    sessions, ignored = analysis.reconstruct_sessions(events, cutoff)
+    covered = await storage.live_voice_intervals(guild.id)
+    sessions, ignored = analysis.reconstruct_sessions(events, covered)
     replaced = await storage.delete_voice_sessions_by_source(guild.id, "backlog")
     added = await storage.add_voice_sessions_bulk(guild.id, sessions)
 
@@ -693,9 +693,9 @@ async def _run_vc_backfill(
     ]
     if replaced:
         lines.append(f"Replaced {replaced:,} sessions from a previous import.")
-    if cutoff:
-        lines.append("Events after Iris's own voice tracking began were skipped "
-                     "so nothing is counted twice.")
+    if covered:
+        lines.append("Time Iris already tracked live was skipped so nothing is "
+                     "counted twice; stretches when she was offline were filled in.")
     if ignored:
         lines.append(f"{ignored:,} events couldn't be paired (log gaps) and were ignored.")
     lines.append("Bots and opted-out members were excluded.")

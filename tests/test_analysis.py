@@ -160,16 +160,38 @@ def test_reconstruct_sessions_tie_leaves_sort_first():
     assert ignored == 0
 
 
-def test_reconstruct_sessions_cutoff_clips_and_drops():
+def test_reconstruct_sessions_covered_clips_and_drops():
     events = [
         (1000, 1, 50, "join"),
-        (3000, 1, 50, "leave"),  # spans the cutoff -> clipped to it
+        (3000, 1, 50, "leave"),  # runs into covered time -> clipped to its start
         (4000, 2, 50, "join"),
-        (5000, 2, 50, "leave"),  # entirely after cutoff -> dropped
+        (5000, 2, 50, "leave"),  # entirely covered -> dropped
     ]
-    sessions, ignored = analysis.reconstruct_sessions(events, cutoff=2000)
+    sessions, ignored = analysis.reconstruct_sessions(events, [(2000, 6000)])
     assert sessions == [(1, 50, 1000, 2000)]
     assert ignored == 1
+
+
+def test_reconstruct_sessions_backfills_a_downtime_gap():
+    # The bug this guards: one early live span must not shadow every later
+    # event. A session straddling the offline stretch keeps both open pieces.
+    events = [
+        (1000, 1, 50, "join"),
+        (7000, 1, 50, "leave"),
+        (8000, 2, 50, "join"),
+        (9000, 2, 50, "leave"),  # wholly inside the second live span
+    ]
+    covered = [(2000, 3000), (7500, 9500)]  # bot down between 3000 and 7500
+    sessions, ignored = analysis.reconstruct_sessions(events, covered)
+    assert sessions == [(1, 50, 1000, 2000), (1, 50, 3000, 7000)]
+    assert ignored == 1
+
+
+def test_uncovered_spans_edges():
+    assert list(analysis.uncovered_spans(100, 200, [])) == [(100, 200)]
+    # touching but not overlapping spans leave the session whole
+    assert list(analysis.uncovered_spans(100, 200, [(0, 100), (200, 300)])) == [(100, 200)]
+    assert list(analysis.uncovered_spans(100, 200, [(50, 250)])) == []
 
 
 def test_summary_empty():

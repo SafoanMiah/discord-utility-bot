@@ -62,7 +62,9 @@ backfills.
 - If the bot crashes, voice time still gets saved. It checkpoints every
   minute, so worst case you lose 60 seconds.
 - Both `/backlog` commands are safe to run again, they skip anything already
-  recorded instead of counting it twice.
+  recorded instead of counting it twice. `/backlog vc` also fills in stretches
+  when the bot was offline, so downtime can be recovered from CircleBot's logs
+  after the fact.
 - Only run one copy of the bot at a time.
 
 ## Hosting

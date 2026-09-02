@@ -133,8 +133,29 @@ def summary(
 VoiceEvent = tuple[int, int, int, str]  # (ts_utc, user_id, channel_id, 'join'|'leave')
 
 
+def uncovered_spans(
+    start: int, end: int, covered: Sequence[tuple[int, int]]
+) -> Iterator[tuple[int, int]]:
+    """Yield the pieces of [start, end) that fall outside `covered` (sorted,
+    merged, non-overlapping spans). A session straddling a coverage gap comes
+    back as several pieces; a fully covered one yields nothing."""
+    cursor = start
+    for c_start, c_end in covered:
+        if c_end <= cursor:
+            continue
+        if c_start >= end:
+            break
+        if c_start > cursor:
+            yield (cursor, c_start)
+        cursor = c_end
+        if cursor >= end:
+            return
+    if cursor < end:
+        yield (cursor, end)
+
+
 def reconstruct_sessions(
-    events: Iterable[VoiceEvent], cutoff: int | None = None
+    events: Iterable[VoiceEvent], covered: Sequence[tuple[int, int]] | None = None
 ) -> tuple[list[tuple[int, int, int, int]], int]:
     """Pair join/leave events (e.g. parsed from a logging bot's history) into
     (user_id, channel_id, start_utc, end_utc) sessions.
@@ -145,8 +166,11 @@ def reconstruct_sessions(
       is unknowable and dropped (counted in the returned `ignored`).
     - At equal timestamps a leave sorts before a join, so move pairs and
       instant rejoins resolve correctly.
-    - Sessions are clipped to end before `cutoff` (the moment live capture
-      began); anything starting at or after it is dropped as already covered.
+    - Sessions are trimmed against `covered`, the spans live capture already
+      recorded. Only the uncovered remainder is kept, so downtime between two
+      live spans still backfills while live time is never counted twice. A
+      session lying entirely inside a covered span is dropped (counted in
+      `ignored`).
     """
     open_sessions: dict[int, tuple[int, int]] = {}  # user_id -> (start, channel)
     sessions: list[tuple[int, int, int, int]] = []
@@ -168,14 +192,15 @@ def reconstruct_sessions(
             ignored += 1
     ignored += len(open_sessions)
 
-    if cutoff is not None:
-        clipped = []
+    if covered:
+        trimmed = []
         for user_id, chan, start, end in sessions:
-            if start >= cutoff:
+            pieces = list(uncovered_spans(start, end, covered))
+            if not pieces:
                 ignored += 1
                 continue
-            clipped.append((user_id, chan, start, min(end, cutoff)))
-        sessions = clipped
+            trimmed += [(user_id, chan, s, e) for s, e in pieces]
+        sessions = trimmed
     return sessions, ignored
 
 

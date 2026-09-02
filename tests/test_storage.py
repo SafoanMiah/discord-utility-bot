@@ -76,9 +76,12 @@ async def _flow(db_path: str) -> None:
     assert await s.get_open_sessions() == []
     assert (201, 7100, 7200) in await s.get_voice_sessions(1, 10)
 
-    # imported sessions: tagged source, replaceable wholesale, capped by the
-    # earliest live session
-    assert await s.earliest_live_voice_start(10) == 5000  # first live session above
+    # imported sessions: tagged source, replaceable wholesale, trimmed against
+    # the spans live capture already covered
+    intervals = await s.live_voice_intervals(10)
+    assert intervals == sorted(intervals)
+    assert all(a[1] < b[0] for a, b in zip(intervals, intervals[1:]))  # merged
+    assert intervals[0][0] == 5000  # first live session above
     assert await s.add_voice_sessions_bulk(10, [(4, 300, 100, 700), (4, 300, 900, 1200)]) == 2
     assert len(await s.get_voice_sessions(4, 10)) == 2  # reads merge both sources
     assert await s.delete_voice_sessions_by_source(10, "backlog") == 2
